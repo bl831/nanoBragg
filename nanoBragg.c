@@ -1,4 +1,4 @@
-/* perfect-lattice nanocrystal diffraction simulator            -James Holton and Ken Frankel           12-5-23
+/* perfect-lattice nanocrystal diffraction simulator            -James Holton and Ken Frankel           8-10-25
 
 example:
 
@@ -967,6 +967,10 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-default_F") && (argc > (i+1)))
             {
                 default_F = atof(argv[i+1]);
+            }
+            if(strstr(argv[i], "-dump") && (argc > (i+1)))
+            {
+                dumpfilename = argv[i+1];
             }
             if(strstr(argv[i], "-img") && (argc > (i+1)))
             {
