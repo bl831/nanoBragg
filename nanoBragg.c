@@ -2627,6 +2627,17 @@ if(! debug_printed_thread) {
 //    printf("thread: %d mosaic_umats = %p\n", omp_get_thread_num(),mosaic_umats);
     debug_printed_thread = 1;
 }
+    if(interpolate){
+//        printf("re-allocating sub_Fhkl on thread %d\n",omp_get_thread_num());
+        sub_Fhkl = (double***) calloc(6,sizeof(double**));
+        for (h0=0; h0<=5;h0++) {
+            *(sub_Fhkl +h0) = (double**) calloc(6,sizeof(double*));
+            for (k0=0; k0<=5;k0++) {
+                *(*(sub_Fhkl +h0)+k0) = (double*) calloc(6,sizeof(double));
+            }
+        }
+    }
+
 #endif
 
         for(fpixel=0;fpixel<fpixels;++fpixel)
@@ -2941,6 +2952,7 @@ if(! debug_printed_thread) {
 
                                     /* only interpolate if it is safe */
                                     if(interpolate){
+
                                         /* integer versions of nearest HKL indicies */
                                         h_interp[0]=h0_flr-1;
                                         h_interp[1]=h0_flr;
