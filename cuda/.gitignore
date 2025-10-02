@@ -1,0 +1,9 @@
+# Build artifacts.
+build\
+cmake\
+
+# Test output.
+test_output\
+
+# VSCode settings.
+.vscode\
