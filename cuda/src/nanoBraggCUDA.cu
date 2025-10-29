@@ -189,13 +189,13 @@ double unitizeCPU(double * vector, double * new_unit_vector) {
 __global__ void nanoBraggSpotsInitCUDAKernel(int spixels, int fpixesl, float * floatimage, float * omega_reduction, float * max_I_x_reduction,
         float * max_I_y_reduction, bool * rangemap);
 
-__global__ void nanoBraggSpotsCUDAKernel(detectorParams * detectorPtr, beamParams * beamPtr, goniometerParams * goniometerPtr, sampleParams * samplePtr,
+__global__ void nanoBraggSpotsCUDAKernel_CC6_1(detectorParams * detectorPtr, beamParams * beamPtr, goniometerParams * goniometerPtr, sampleParams * samplePtr,
         crystalParams * crystalPtr, constParams * constantsPtr, const beamSource * __restrict__ beam_sources, const CUDAREAL * __restrict__ Fhkl,
         const matrix3x3 * __restrict__ mosaic_umats, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap);
 
-__global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detectorPtr, beamParams * beamPtr, goniometerParams * goniometerPtr, sampleParams * samplePtr,
-        crystalParams * crystalPtr, constParams * constantsPtr, const beamSource * __restrict__ beam_sources, const CUDAREAL * __restrict__ Fhkl,
+__global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict__ detectorPtr, const beamParams * __restrict__ beamPtr, const goniometerParams * __restrict__ goniometerPtr, const sampleParams * __restrict__ samplePtr,
+        crystalParams * crystalPtr, const constParams * __restrict__ constantsPtr, const beamSource * __restrict__ beam_sources, const CUDAREAL * __restrict__ Fhkl,
         const matrix3x3 * __restrict__ mosaic_umats, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap);
 
@@ -428,7 +428,7 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     //  CUDA_CHECK_RETURN(cudaPeekAtLastError());
     //  CUDA_CHECK_RETURN(cudaDeviceSynchronize());
 
-    nanoBraggSpotsCUDAKernelv1<<<numBlocks, threadsPerBlock>>>(cu_detector, cu_beam, cu_goniometer, cu_sample, cu_crystal, cu_constants, cu_beam_sources, cu_Fhkl,
+    nanoBraggSpotsCUDAKernel_CC9_0<<<numBlocks, threadsPerBlock>>>(cu_detector, cu_beam, cu_goniometer, cu_sample, cu_crystal, cu_constants, cu_beam_sources, cu_Fhkl,
             cu_mosaic_umats, cu_maskimage, cu_floatimage /*out*/, cu_omega_reduction/*out*/, cu_max_I_x_reduction/*out*/, cu_max_I_y_reduction /*out*/, cu_rangemap /*out*/);
 
     CUDA_CHECK_RETURN(cudaPeekAtLastError());
@@ -536,6 +536,8 @@ __device__ __inline__ CUDAREAL quickFcell_ldg(short hkls, short h0, short h_max,
 __device__ __inline__ void quickFcell_ldg(int hkls, CUDAREAL h, int h_max, int h_min, CUDAREAL k, int k_max, int k_min, CUDAREAL l, int l_max, int l_min,
         int h_range, int k_range, int l_range, const CUDAREAL * __restrict__ Fhkl, CUDAREAL * F_cell);
 
+__device__ __inline__ CUDAREAL norm3d_fma_rn(CUDAREAL v1, CUDAREAL v2, CUDAREAL v3);
+
 __global__ void nanoBraggSpotsInitCUDAKernel(int spixels, int fpixels, float * floatimage, float * omega_reduction, float * max_I_x_reduction,
         float * max_I_y_reduction, bool * rangemap) {
 
@@ -561,7 +563,7 @@ __global__ void nanoBraggSpotsInitCUDAKernel(int spixels, int fpixels, float * f
     }
 }
 
-__global__ void nanoBraggSpotsCUDAKernel(detectorParams * detector, beamParams * beam, goniometerParams * goniometer, sampleParams * sample,
+__global__ void nanoBraggSpotsCUDAKernel_CC6_1(detectorParams * detector, beamParams * beam, goniometerParams * goniometer, sampleParams * sample,
         crystalParams * crystal, constParams * constants, const beamSource * __restrict__ beam_sources, const CUDAREAL * __restrict__ Fhkl,
         const matrix3x3 * __restrict__ mosaic_umats, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/,
@@ -741,39 +743,17 @@ __global__ void nanoBraggSpotsCUDAKernel(detectorParams * detector, beamParams *
     }
 }
 
-__global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams * beam, goniometerParams * goniometer, sampleParams * sample,
-        crystalParams * crystal, constParams * constants, const beamSource * __restrict__ beam_sources, const CUDAREAL * __restrict__ Fhkl,
+__global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict__ detector, const beamParams * __restrict__ beam, const goniometerParams * __restrict__ goniometer, const sampleParams * __restrict__ sample,
+        crystalParams * crystal, const constParams * __restrict__ constants, const beamSource * __restrict__ beam_sources, const CUDAREAL * __restrict__ Fhkl,
         const matrix3x3 * __restrict__ mosaic_umats, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/,
         float * max_I_y_reduction /*out*/, bool * rangemap) {
 
-    __shared__ CUDAREAL s_dmin;
-
-    __shared__ bool s_calc_polar;
-
-    __shared__ short s_phisteps;
-    __shared__ CUDAREAL s_phi0, s_phistep;
-    __shared__ short s_mosaic_domains;
-    __shared__ bool s_rotate_umat;
-
-    __shared__ shapetype s_xtal_shape;
     __shared__ CUDAREAL s_Na, s_Nb, s_Nc;
     __shared__ short s_hkls, s_h_max, s_h_min, s_k_max, s_k_min, s_l_max, s_l_min, s_h_range, s_k_range, s_l_range;
 
     if (threadIdx.x == 0 && threadIdx.y == 0) {
 
-        s_dmin = crystal->dmin;
-
-        s_calc_polar = beam->calc_polar;
-
-        s_phisteps = goniometer->phisteps;
-        s_phi0 = goniometer->phi0;
-        s_phistep = goniometer->phistep;
-
-        s_mosaic_domains = crystal->mosaic_domains;
-        s_rotate_umat = crystal->rotate_umat;
-
-        s_xtal_shape = crystal->xtal_shape;
 
         s_Na = crystal->Na;
         s_Nb = crystal->Nb;
@@ -801,18 +781,9 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
     const long stride = fstride * sstride;
 
     /* add background from something amorphous */
-    CUDAREAL F_bg = sample->water_F;
-    CUDAREAL I_bg = F_bg * F_bg * constants->r_e_sqr * beam->fluence * sample->water_size * sample->water_size * sample->water_size * 1e6 * constants->Avogadro / sample->water_MW;
+    const CUDAREAL F_bg = sample->water_F;
+    const CUDAREAL I_bg = F_bg * F_bg * constants->r_e_sqr * beam->fluence * sample->water_size * sample->water_size * sample->water_size * 1e6 * constants->Avogadro / sample->water_MW;
 
-//  hklParams[0] = h_min;
-//  hklParams[1] = h_max;
-//  hklParams[2] = h_range;
-//  hklParams[3] = k_min;
-//  hklParams[4] = k_max;
-//  hklParams[5] = k_range;
-//  hklParams[6] = l_min;
-//  hklParams[7] = l_max;
-//  hklParams[8] = l_range;
 
     for (long pixIdx = (blockDim.y * blockIdx.y + threadIdx.y) * fstride + blockDim.x * blockIdx.x + threadIdx.x; pixIdx < total_pixels; pixIdx += stride) {
         const short fpixel = pixIdx % detector->fpixels;
@@ -840,7 +811,7 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
         CUDAREAL max_I_x_sub_reduction = 0.0;
         CUDAREAL max_I_y_sub_reduction = 0.0;
         CUDAREAL polar = 0.0;
-        if (!s_calc_polar) {
+        if (beam->calc_polar) {
             polar = 1.0;
         }
 
@@ -850,10 +821,8 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
         for (short subS = 0; subS < detector->oversample; ++subS) { // Y voxel
             for (short subF = 0; subF < detector->oversample; ++subF) { // X voxel
                 /* absolute mm position on detector (relative to its origin) */
-                CUDAREAL Fdet = detector->subpixel_size * (fpixel * detector->oversample + subF) + detector->subpixel_size / 2.0; // X voxel
-                CUDAREAL Sdet = detector->subpixel_size * (spixel * detector->oversample + subS) + detector->subpixel_size / 2.0; // Y voxel
-                //                  Fdet = pixel_size*fpixel;
-                //                  Sdet = pixel_size*spixel;
+                CUDAREAL Fdet = detector->subpixel_size * (fpixel * detector->oversample + subF) + detector->subpixel_size / (CUDAREAL)2.0; // X voxel
+                CUDAREAL Sdet = detector->subpixel_size * (spixel * detector->oversample + subS) + detector->subpixel_size / (CUDAREAL)2.0; // Y voxel
 
                 max_I_x_sub_reduction = Fdet;
                 max_I_y_sub_reduction = Sdet;
@@ -863,14 +832,11 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
                     CUDAREAL Odet = thick_tic * detector->detector_thickstep; // Z Orthagonal voxel.
 
                     /* construct detector subpixel position in 3D space */
-                    //                      pixel_X = distance;
-                    //                      pixel_Y = Sdet-Ybeam;
-                    //                      pixel_Z = Fdet-Xbeam;
-                    //CUDAREAL * pixel_pos = tmpVector1;
                     CUDAREAL pixel_pos[4];
-                    pixel_pos[1] = Fdet * __ldg(&detector->fdet_vector[1]) + Sdet * __ldg(&detector->sdet_vector[1]) + Odet * __ldg(&detector->odet_vector[1]) + __ldg(&detector->pix0_vector[1]); // X
-                    pixel_pos[2] = Fdet * __ldg(&detector->fdet_vector[2]) + Sdet * __ldg(&detector->sdet_vector[2]) + Odet * __ldg(&detector->odet_vector[2]) + __ldg(&detector->pix0_vector[2]); // Y
-                    pixel_pos[3] = Fdet * __ldg(&detector->fdet_vector[3]) + Sdet * __ldg(&detector->sdet_vector[3]) + Odet * __ldg(&detector->odet_vector[3]) + __ldg(&detector->pix0_vector[3]); // Z
+                    pixel_pos[1] = Fdet * detector->fdet_vector[1] + Sdet * detector->sdet_vector[1] + Odet * detector->odet_vector[1] + detector->pix0_vector[1]; // X
+                    pixel_pos[2] = Fdet * detector->fdet_vector[2] + Sdet * detector->sdet_vector[2] + Odet * detector->odet_vector[2] + detector->pix0_vector[2]; // Y
+                    pixel_pos[3] = Fdet * detector->fdet_vector[3] + Sdet * detector->sdet_vector[3] + Odet * detector->odet_vector[3] + detector->pix0_vector[3]; // Z
+
                     if (detector->curved_detector) {
                         /* construct detector pixel that is always "distance" from the sample */
                         CUDAREAL dbvector[4];
@@ -881,10 +847,8 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
                         CUDAREAL newvector[4];
                         rotate_axis(dbvector, newvector, detector->sdet_vector, pixel_pos[2] / sample->distance);
                         rotate_axis(newvector, pixel_pos, detector->fdet_vector, pixel_pos[3] / sample->distance);
-                        //                          rotate(vector,pixel_pos,0,pixel_pos[3]/distance,pixel_pos[2]/distance);
                     }
                     /* construct the diffracted-beam unit vector to this sub-pixel */
-                    //CUDAREAL * diffracted = tmpVector2;
                     CUDAREAL diffracted[4];
                     CUDAREAL airpath = unitize(pixel_pos, diffracted);
 
@@ -908,78 +872,38 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
                     for (short source = 0; source < beam->sources; ++source) {
 
                         /* retrieve stuff from cache */
-                        //CUDAREAL * incident = tmpVector1;
-//                      CUDAREAL incident[4];
-//                      incident[1] = -__ldg(&source_X[source]);
-//                      incident[2] = -__ldg(&source_Y[source]);
-//                      incident[3] = -__ldg(&source_Z[source]);
                         CUDAREAL lambda = __ldg(&beam_sources[source].lambda);
 
                         /* construct the incident beam unit vector while recovering source distance */
-                        // TODO[Giles]: Optimization! We can unitize the source vectors before passing them in.
-//                      unitize(incident, incident);
-//                      CUDAREAL source_path = unitize(incident, incident);
-//                      CUDAREAL source_path = norm3d(incident[1], incident[2], incident[3]);
-//                      CUDAREAL * d = tmpVector2;
-//                      d[0] = diffracted[0];
-//                      d[1] = diffracted[1];
-//                      d[2] = diffracted[2];
-//                      d[3] = diffracted[3];
                         /* construct the scattering vector for this pixel */
-//                      CUDAREAL * scattering = tmpVector1;
                         CUDAREAL scattering[4];
-//                      scattering[1] = (diffracted[1] + incident[1]) / lambda;
-//                      scattering[2] = (diffracted[2] + incident[2]) / lambda;
-//                      scattering[3] = (diffracted[3] + incident[3]) / lambda;
                         scattering[1] = (diffracted[1] - __ldg(&beam_sources[source].neg_unit_source_vector[1])) / lambda;
                         scattering[2] = (diffracted[2] - __ldg(&beam_sources[source].neg_unit_source_vector[2])) / lambda;
                         scattering[3] = (diffracted[3] - __ldg(&beam_sources[source].neg_unit_source_vector[3])) / lambda;
-//                      const CUDAREAL * neg_source_vector = vector_address(unit_neg_source_vectors, source, VECTOR_SIZE);
-//                      scattering[1] = (diffracted[1] - __ldg(&neg_source_vector[1])) / lambda;
-//                      scattering[2] = (diffracted[2] - __ldg(&neg_source_vector[2])) / lambda;
-//                      scattering[3] = (diffracted[3] - __ldg(&neg_source_vector[3])) / lambda;
-//                      CUDAREAL scattering[] = { 0.0, (diffracted[1] - incident[1]) / lambda, (diffracted[2] - incident[2]) / lambda, (diffracted[3]
-//                              - incident[3]) / lambda };
 
                         /* sin(theta)/lambda is half the scattering vector length */
-//                      magnitude(scattering);
-//                      CUDAREAL stol = 0.5 * scattering[0];
-                        CUDAREAL stol = 0.5 * norm3d(scattering[1], scattering[2], scattering[3]);
+                        CUDAREAL stol = (CUDAREAL)0.5 * norm3d_fma_rn(scattering[1], scattering[2], scattering[3]);
 
                         /* rough cut to speed things up when we aren't using whole detector */
-                        if (s_dmin > 0.0 && stol > 0.0) {
-                            if (s_dmin > 0.5 / stol) {
+                        if (crystal->dmin > 0.0 && stol > 0.0) {
+                            if (crystal->dmin > 0.5f / stol) {
                                 continue;
                             }
                         }
 
                         /* polarization factor */
-                        if (s_calc_polar) {
+                        if (beam->calc_polar) {
                             /* need to compute polarization factor */
                             CUDAREAL incident[4];
                             incident[1] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
                             incident[2] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
                             incident[3] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
                             polar = polarization_factor(beam->polarization, incident, diffracted, beam->polar_vector);
-//                          const CUDAREAL * neg_source_vector = vector_address(unit_neg_source_vectors, source, VECTOR_SIZE);
-//                          CUDAREAL incident[4];
-//                          incident[1] = __ldg(&unit_neg_source_vectors[source * VECTOR_SIZE + 1]) / lambda;
-//                          incident[2] = __ldg(&unit_neg_source_vectors[source * VECTOR_SIZE + 2]) / lambda;
-//                          incident[3] = __ldg(&unit_neg_source_vectors[source * VECTOR_SIZE + 3]) / lambda;
-//                          polar = polarization_factor(polarization, incident, diffracted, polar_vector);
-//                          CUDAREAL incident[4];
-//                          incident[1] = __ldg(&neg_source_vector[1]);
-//                          incident[2] = __ldg(&neg_source_vector[2]);
-//                          incident[3] = __ldg(&neg_source_vector[3]);
-//                          //                          polar = polarization_factor(polarization, incident, diffracted, polar_vector);
-
-//                          const CUDAREAL * neg_source_vector = vector_address(unit_neg_source_vectors, source, VECTOR_SIZE);
-//                          polar = polarization_factor_ldg(polarization, neg_source_vector, diffracted, polar_vector);
                         }
 
                         /* sweep over phi angles */
-                        for (short phi_tic = 0; phi_tic < s_phisteps; ++phi_tic) {
-                            CUDAREAL phi = s_phistep * phi_tic + s_phi0;
+                        for (short phi_tic = 0; phi_tic < goniometer->phisteps; ++phi_tic) {
+                            CUDAREAL phi = goniometer->phistep * phi_tic + goniometer->phi0;
 
 //                          CUDAREAL ap[] = { 0.0, 0.0, 0.0, 0.0 };
 //                          CUDAREAL bp[] = { 0.0, 0.0, 0.0, 0.0 };
@@ -994,12 +918,12 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
                             rotate_axis_ldg(crystal->uc.c0, cp, goniometer->spindle_vector, phi);
 
                             /* enumerate mosaic domains */
-                            for (short mos_tic = 0; mos_tic < s_mosaic_domains; ++mos_tic) {
+                            for (short mos_tic = 0; mos_tic < crystal->mosaic_domains; ++mos_tic) {
                                 /* apply mosaic rotation after phi rotation */
                                 CUDAREAL a[4];
                                 CUDAREAL b[4];
                                 CUDAREAL c[4];
-                                if (s_rotate_umat) {
+                                if (crystal->rotate_umat) {
                                     rotate_umat_ldg(ap, a, &mosaic_umats[mos_tic]);
                                     rotate_umat_ldg(bp, b, &mosaic_umats[mos_tic]);
                                     rotate_umat_ldg(cp, c, &mosaic_umats[mos_tic]);
@@ -1020,49 +944,40 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
 
                                 /* construct fractional Miller indicies */
 
-//                              CUDAREAL * scat_s = tmpVector2;
-//                              scat_s[0] = scattering[0];
-//                              scat_s[1] = scattering[1];
-//                              scat_s[2] = scattering[2];
-//                              scat_s[3] = scattering[3];
-//
-//                              CUDAREAL h = dot_product(a, scat_s);
-//                              CUDAREAL k = dot_product(b, scat_s);
-//                              CUDAREAL l = dot_product(c, scat_s);
                                 CUDAREAL h = dot_product(a, scattering);
                                 CUDAREAL k = dot_product(b, scattering);
                                 CUDAREAL l = dot_product(c, scattering);
 
                                 /* round off to nearest whole index */
-                                short h0 = ceil(h - 0.5);
-                                short k0 = ceil(k - 0.5);
-                                short l0 = ceil(l - 0.5);
+                                short h0 = ceil(h - (CUDAREAL)0.5);
+                                short k0 = ceil(k - (CUDAREAL)0.5);
+                                short l0 = ceil(l - (CUDAREAL)0.5);
 
                                 /* structure factor of the lattice (paralelpiped crystal)
                                  F_latt = sin(M_PI*Na*h)*sin(M_PI*Nb*k)*sin(M_PI*Nc*l)/sin(M_PI*h)/sin(M_PI*k)/sin(M_PI*l);
                                  */
                                 CUDAREAL F_latt = 1.0; // Shape transform for the crystal.
-                                if (s_xtal_shape == SQUARE) {
+                                if (crystal->xtal_shape == SQUARE) {
                                     /* xtal is a paralelpiped */
-                                    if (s_Na > 1) {
-                                        F_latt *= sincg(M_PI * h, s_Na);
+                                    if (crystal->Na > 1) {
+                                        F_latt *= sincg((CUDAREAL)M_PI * h, crystal->Na);
                                     }
-                                    if (s_Nb > 1) {
-                                        F_latt *= sincg(M_PI * k, s_Nb);
+                                    if (crystal->Nb > 1) {
+                                        F_latt *= sincg((CUDAREAL)M_PI * k, crystal->Nb);
                                     }
-                                    if (s_Nc > 1) {
-                                        F_latt *= sincg(M_PI * l, s_Nc);
+                                    if (crystal->Nc > 1) {
+                                        F_latt *= sincg((CUDAREAL)M_PI * l, crystal->Nc);
                                     }
-                                } else if (s_xtal_shape == ROUND) {
+                                } else if (crystal->xtal_shape == ROUND) {
                                     /* use sinc3 for elliptical xtal shape,
                                      correcting for sqrt of volume ratio between cube and sphere */
                                     CUDAREAL hrad_sqr = (h - h0) * (h - h0) * s_Na * s_Na + (k - k0) * (k - k0) * s_Nb * s_Nb + (l - l0) * (l - l0) * s_Nc * s_Nc;
                                     F_latt = s_Na * s_Nb * s_Nc * 0.723601254558268 * sinc3(M_PI * sqrt(hrad_sqr * 1.0f /*fudge*/));
-                                } else if (s_xtal_shape == GAUSS) {
+                                } else if (crystal->xtal_shape == GAUSS) {
                                     /* fudge the radius so that volume and FWHM are similar to square_xtal spots */
                                     CUDAREAL hrad_sqr = (h - h0) * (h - h0) * s_Na * s_Na + (k - k0) * (k - k0) * s_Nb * s_Nb + (l - l0) * (l - l0) * s_Nc * s_Nc;
                                     F_latt = s_Na * s_Nb * s_Nc * exp(-(hrad_sqr / 0.63 * 1.0f /*fudge*/));
-                                } else if (s_xtal_shape == TOPHAT) {
+                                } else if (crystal->xtal_shape == TOPHAT) {
                                     /* make a flat-top spot of same height and volume as square_xtal spots */
                                     CUDAREAL hrad_sqr = (h - h0) * (h - h0) * s_Na * s_Na + (k - k0) * (k - k0) * s_Nb * s_Nb + (l - l0) * (l - l0) * s_Nc * s_Nc;
                                     F_latt = s_Na * s_Nb * s_Nc * (hrad_sqr * 1.0f /*fudge*/ < 0.3969);
@@ -1073,13 +988,21 @@ __global__ void nanoBraggSpotsCUDAKernelv1(detectorParams * detector, beamParams
                                 /* structure factor of the unit cell */
 //                              CUDAREAL F_cell = s_default_F;
                                 CUDAREAL F_cell =
-                                        s_hkls ?
-                                                 quickFcell_ldg(s_hkls, h0, s_h_max, s_h_min, k0, s_k_max, s_k_min, l0, s_l_max, s_l_min, s_h_range, s_k_range,
-                                                         s_l_range, Fhkl) :
+                                        crystal->fhklParams.hkls ?
+                                                 quickFcell_ldg(crystal->fhklParams.hkls,
+                                                    h0,
+                                                    crystal->fhklParams.h_max,
+                                                    crystal->fhklParams.h_min,
+                                                    k0,
+                                                    crystal->fhklParams.k_max,
+                                                    crystal->fhklParams.k_min,
+                                                    l0,
+                                                    crystal->fhklParams.l_max,
+                                                    crystal->fhklParams.l_min,
+                                                    crystal->fhklParams.h_range,
+                                                    crystal->fhklParams.k_range,
+                                                    crystal->fhklParams.l_range, Fhkl) :
                                                  crystal->default_F;
-//                              quickFcell_ldg(s_hkls, h, s_h_max, s_h_min, k, s_k_max, s_k_min, l, s_l_max, s_l_min, s_h_range, s_k_range, s_l_range,
-//                                      Fhkl, &F_cell);
-//                                  F_cell = __ldg(&Fhkl[flatten3dindex(h0 - s_h_min, k0 - s_k_min, l0 - s_l_min, s_h_range, s_k_range, s_l_range)]);
 
                                 /* now we have the structure factor for this pixel */
 
@@ -1154,9 +1077,12 @@ CUDAREAL * newv, const CUDAREAL * __restrict__ axis, const CUDAREAL phi) {
     const CUDAREAL v3 = v[3];
     const CUDAREAL dot = (a1 * v1 + a2 * v2 + a3 * v3) * (1.0 - cosphi);
 
-    newv[1] = a1 * dot + v1 * cosphi + (-a3 * v2 + a2 * v3) * sinphi;
-    newv[2] = a2 * dot + v2 * cosphi + (+a3 * v1 - a1 * v3) * sinphi;
-    newv[3] = a3 * dot + v3 * cosphi + (-a2 * v1 + a1 * v2) * sinphi;
+    newv[1] = __fmaf_rn(a1, dot, v1 * cosphi) + __fmaf_rn(-a3, v2, a2 * v3) * sinphi;
+    newv[2] = __fmaf_rn(a2, dot, v2 * cosphi) + __fmaf_rn(+a3, v1, -a1 * v3) * sinphi;
+    newv[3] = __fmaf_rn(a3, dot, v3 * cosphi) + __fmaf_rn(-a2, v1, a1 * v2) * sinphi;
+    // newv[1] = a1 * dot + v1 * cosphi + (+a3 * v1 - a1 * v3) * sinphi;
+    // newv[2] = a2 * dot + v2 * cosphi + (+a3 * v1 - a1 * v3) * sinphi;
+    // newv[3] = a3 * dot + v3 * cosphi + (-a2 * v1 + a1 * v2) * sinphi;
 
     return newv;
 }
@@ -1173,11 +1099,17 @@ CUDAREAL * newv, const CUDAREAL * __restrict__ axis, const CUDAREAL phi) {
     const CUDAREAL v1 = __ldg(&v[1]);
     const CUDAREAL v2 = __ldg(&v[2]);
     const CUDAREAL v3 = __ldg(&v[3]);
-    const CUDAREAL dot = (a1 * v1 + a2 * v2 + a3 * v3) * (1.0 - cosphi);
+    
+//    const CUDAREAL dot = __fmaf_rn(a3, v3, __fmaf_rn(a1, v1, a2 * v2)) * (1.0 - cosphi);
+    
+    const CUDAREAL dot = (a1 * v1 + a2 * v2 + a3 * v3) * (1.0f - cosphi);
 
-    newv[1] = a1 * dot + v1 * cosphi + (-a3 * v2 + a2 * v3) * sinphi;
-    newv[2] = a2 * dot + v2 * cosphi + (+a3 * v1 - a1 * v3) * sinphi;
-    newv[3] = a3 * dot + v3 * cosphi + (-a2 * v1 + a1 * v2) * sinphi;
+    newv[1] = __fmaf_rn(a1, dot, v1 * cosphi) + __fmaf_rn(-a3, v2, a2 * v3) * sinphi;
+    newv[2] = __fmaf_rn(a2, dot, v2 * cosphi) + __fmaf_rn(+a3, v1, -a1 * v3) * sinphi;
+    newv[3] = __fmaf_rn(a3, dot, v3 * cosphi) + __fmaf_rn(-a2, v1, a1 * v2) * sinphi;
+    // newv[1] = (a1 * dot) + (v1 * cosphi) + (-a3 * v2 + a2 * v3) * sinphi;
+    // newv[2] = (a2 * dot) + (v2 * cosphi) + (+a3 * v1 - a1 * v3) * sinphi;
+    // newv[3] = (a3 * dot) + (v3 * cosphi) + (-a2 * v1 + a1 * v2) * sinphi;
 
     return newv;
 }
@@ -1190,7 +1122,8 @@ __device__ CUDAREAL unitize(CUDAREAL * vector, CUDAREAL * new_unit_vector) {
     CUDAREAL v3 = vector[3];
     //	CUDAREAL mag = sqrt(v1 * v1 + v2 * v2 + v3 * v3);
 
-    CUDAREAL mag = norm3d(v1, v2, v3);
+    //  CUDAREAL mag = norm3d(v1, v2, v3);
+    CUDAREAL mag = norm3d_fma_rn(v1, v2, v3);
 
     if (mag != 0.0) {
         /* normalize it */
@@ -1283,7 +1216,7 @@ __device__ CUDAREAL sincg(CUDAREAL x, CUDAREAL N) {
 /* Fourier transform of a sphere */
 __device__ CUDAREAL sinc3(CUDAREAL x) {
     if (x != 0.0)
-        return 3.0 * (sin(x) / x - cos(x)) / (x * x);
+        return 3.0f * (sin(x) / x - cos(x)) / (x * x);
 
     return 1.0;
 
@@ -1324,7 +1257,7 @@ CUDAREAL *y) {
 __device__ CUDAREAL polarization_factor(CUDAREAL kahn_factor, const CUDAREAL * __restrict__ unitIncident, CUDAREAL *unitDiffracted,
         const CUDAREAL * __restrict__ unitAxis) {
     CUDAREAL cos2theta, cos2theta_sqr, sin2theta_sqr;
-    CUDAREAL psi = 0.0;
+    CUDAREAL psi = 0.0f;
     CUDAREAL E_in[4], B_in[4], E_out[4], B_out[4];
 
     //  these are already unitized before entering this loop. Optimize this out.
@@ -1334,7 +1267,7 @@ __device__ CUDAREAL polarization_factor(CUDAREAL kahn_factor, const CUDAREAL * _
     /* component of diffracted unit vector along incident beam unit vector */
     cos2theta = dot_product(unitIncident, unitDiffracted);
     cos2theta_sqr = cos2theta * cos2theta;
-    sin2theta_sqr = 1 - cos2theta_sqr;
+    sin2theta_sqr = 1.0f - cos2theta_sqr;
 
     if (kahn_factor != 0.0) {
         /* tricky bit here is deciding which direciton the E-vector lies in for each source
@@ -1361,7 +1294,7 @@ __device__ CUDAREAL polarization_factor(CUDAREAL kahn_factor, const CUDAREAL * _
     }
 
     /* correction for polarized incident beam */
-    return 0.5 * (1.0 + cos2theta_sqr - kahn_factor * cos(2 * psi) * sin2theta_sqr);
+    return 0.5f * (1.0f + cos2theta_sqr - kahn_factor * cos(2.0f * psi) * sin2theta_sqr);
 }
 
 __device__ CUDAREAL polarization_factor_ldg(CUDAREAL kahn_factor, const CUDAREAL * __restrict__ unitIncident, CUDAREAL *unitDiffracted,
@@ -1404,5 +1337,13 @@ __device__ CUDAREAL polarization_factor_ldg(CUDAREAL kahn_factor, const CUDAREAL
     }
 
     /* correction for polarized incident beam */
-    return 0.5 * (1.0 + cos2theta_sqr - kahn_factor * cos(2 * psi) * sin2theta_sqr);
+    return 0.5f * (1.0f + cos2theta_sqr - kahn_factor * cos(2.0f * psi) * sin2theta_sqr);
 }
+
+__device__ CUDAREAL norm3d_fma_rn(CUDAREAL v1, CUDAREAL v2, CUDAREAL v3) {
+    CUDAREAL q_sqr = v3 * v3;
+    q_sqr = __fmaf_rn(v2, v2, q_sqr);
+    q_sqr = __fmaf_rn(v1, v1, q_sqr);
+    return sqrt(q_sqr);
+}
+

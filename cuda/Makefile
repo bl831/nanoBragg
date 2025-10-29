@@ -28,7 +28,7 @@ ARCH_FLAGS = \
 	--generate-code=arch=compute_100,code=[compute_100,sm_100] \
 	--generate-code=arch=compute_120,code=[compute_120,sm_120]
 	
-NVCC_FLAGS = -forward-unknown-to-host-compiler -maxrregcount=32 -std=c++17 $(ARCH_FLAGS) -x cu
+NVCC_FLAGS = -forward-unknown-to-host-compiler -maxrregcount=40 -std=c++17 $(ARCH_FLAGS) -x cu
 
 # Always verbose: Add -v to all compiler flags
 DEBUG_CFLAGS = $(COMMON_CFLAGS) -g -v
