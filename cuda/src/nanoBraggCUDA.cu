@@ -825,6 +825,7 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
         CUDAREAL max_I_x_sub_reduction = 0.0;
         CUDAREAL max_I_y_sub_reduction = 0.0;
         CUDAREAL polar = 1.0;
+        bool polar_computed = false;
 
         /* add this now to avoid problems with skipping later */
         // move this to the bottom to avoid accessing global device memory. floatimage[j] = I_bg;
@@ -914,13 +915,17 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
                         }
 
                         /* polarization factor */
-                        if (beam->calc_polar) {
+                        /* Compute the polarization factor once per pixel (from the first
+                           source) and reuse it, matching the CPU oracle; the boolean flag
+                           keeps the guard uniform across the warp (no divergence). */
+                        if (beam->calc_polar && !polar_computed) {
                             /* need to compute polarization factor */
                             CUDAREAL incident[4];
                             incident[1] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
                             incident[2] = __ldg(&beam_sources[source].neg_unit_source_vector[2]);
                             incident[3] = __ldg(&beam_sources[source].neg_unit_source_vector[3]);
                             polar = polarization_factor(beam->polarization, incident, diffracted, beam->polar_vector);
+                            polar_computed = true;
                         }
 
                         /* sweep over phi angles */
