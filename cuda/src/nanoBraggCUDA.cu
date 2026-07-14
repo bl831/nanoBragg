@@ -1037,9 +1037,9 @@ __device__ __inline__ CUDAREAL quickFcell_ldg(short hkls, short h0, short h_max,
 //		/* just take nearest-neighbor */
 //		*F_cell = __ldg(&Fhkl[flatten3dindex(h0 - h_min, k0 - k_min, l0 - l_min, h_range, k_range, l_range)]);
 //	}
-    short h = min(max(h0 - h_min, 0), h_range);
-    short k = min(max(k0 - k_min, 0), k_range);
-    short l = min(max(l0 - l_min, 0), l_range);
+    short h = min(max(h0 - h_min, 0), h_range - 1);
+    short k = min(max(k0 - k_min, 0), k_range - 1);
+    short l = min(max(l0 - l_min, 0), l_range - 1);
     return __ldg(&Fhkl[flatten3dindex(h, k, l, h_range, k_range, l_range)]);
 }
 
@@ -1049,9 +1049,9 @@ __device__ __inline__ void quickFcell_ldg(int hkls, CUDAREAL h, int h_max, int h
 //		/* just take nearest-neighbor */
 //		*F_cell = __ldg(&Fhkl[flatten3dindex(h0 - h_min, k0 - k_min, l0 - l_min, h_range, k_range, l_range)]);
 //	}
-    int h0 = min(max((int) ceil(h - h_min - 0.5), 0), h_range);
-    int k0 = min(max((int) ceil(k - k_min - 0.5), 0), k_range);
-    int l0 = min(max((int) ceil(l - l_min - 0.5), 0), l_range);
+    int h0 = min(max((int) ceil(h - h_min - 0.5), 0), h_range - 1);
+    int k0 = min(max((int) ceil(k - k_min - 0.5), 0), k_range - 1);
+    int l0 = min(max((int) ceil(l - l_min - 0.5), 0), l_range - 1);
     *F_cell = __ldg(&Fhkl[flatten3dindex(h0, k0, l0, h_range, k_range, l_range)]);
 }
 

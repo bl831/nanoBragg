@@ -2030,6 +2030,38 @@ int main(int argc, char** argv)
                 printf("ERROR: no hkl file and no dump file to read.");
                 exit(9);
             }
+            else
+            {
+                /* No HKL table and no dump file, but a nonzero default_F was
+                   given: this is a VALID "uniform structure factor" run, not an
+                   error. default_F is the value used for any reflection absent
+                   from the table; with no table, every reflection qualifies, so
+                   they all take default_F. The CPU nanoBragg handles this by
+                   running normally and applying default_F everywhere.
+                   Without this branch the GPU path leaves h_min/h_max/h_range
+                   (and k,l) uninitialized, so the wrapper sizes the Fhkl
+                   allocation from those garbage values (unbounded or negative
+                   hklsize_pad) and OOMs or segfaults. Build a minimal bounded
+                   1x1x1 grid so the allocation is tiny and valid; hkls stays 0,
+                   so the kernel falls back to default_F for every reflection,
+                   matching the CPU. */
+                h_min = k_min = l_min = 0;
+                h_max = k_max = l_max = 0;
+                h_range = k_range = l_range = 1;
+                Fhkl = (double***) calloc(h_range+1,sizeof(double**));
+                if(Fhkl==NULL){perror("ERROR");exit(9);};
+                for (h0=0; h0<=h_range;h0++) {
+                    Fhkl[h0] = (double**) calloc(k_range+1,sizeof(double*));
+                    if(Fhkl[h0]==NULL){perror("ERROR");exit(9);};
+                    for (k0=0; k0<=k_range;k0++) {
+                        Fhkl[h0][k0] = (double*) calloc(l_range+1,sizeof(double));
+                        if(Fhkl[h0][k0]==NULL){perror("ERROR");exit(9);};
+                        for (l0=0; l0<=l_range;l0++) {
+                            Fhkl[h0][k0][l0] = default_F;
+                        }
+                    }
+                }
+            }
         }
     }
     else
