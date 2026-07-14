@@ -819,8 +819,10 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
             }
         }
 
-        /* reset photon count for this pixel */
-        CUDAREAL I = I_bg;
+        /* photon accumulator. Water background (I_bg) is not seeded here; it is added
+           at the first sub-pixel below, scaled by that pixel's solid angle, so it
+           tracks the CPU reference. Folding it into I keeps the kernel register-neutral. */
+        CUDAREAL I = 0.0;
         CUDAREAL omega_sub_reduction = 0.0;
         CUDAREAL max_I_x_sub_reduction = 0.0;
         CUDAREAL max_I_y_sub_reduction = 0.0;
@@ -878,6 +880,14 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
                         CUDAREAL parallax = dot_product_ldg(detector->odet_vector, diffracted);
                         capture_fraction = exp(-thick_tic * detector->detector_thickstep * detector->detector_mu / parallax)
                                 - exp(-(thick_tic + 1) * detector->detector_thickstep * detector->detector_mu / parallax);
+                    }
+
+                    /* Add the water background once, scaled by this sub-pixel's solid
+                       angle and capture fraction, so it tracks the CPU reference (which
+                       scales the whole pixel intensity by omega, water included). A no-op
+                       when there is no water (I_bg == 0). */
+                    if (subS == 0 && subF == 0 && thick_tic == 0) {
+                        I += capture_fraction * omega_pixel * I_bg;
                     }
 
                     /* loop over sources now */
@@ -1068,7 +1078,9 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
             /* end of sub-pixel y loop */
         }
         /* end of sub-pixel x loop */
-        const double photons = I_bg + (constants->r_e_sqr * beam->fluence * polar * I) / detector->steps;
+        /* I holds the Bragg sum plus the solid-angle-scaled water background; apply
+           polarization and normalize by the sub-step count. */
+        const double photons = (constants->r_e_sqr * beam->fluence * polar * I) / detector->steps;
         floatimage[j] = photons;
         omega_reduction[j] = omega_sub_reduction; // shared contention
         max_I_x_reduction[j] = max_I_x_sub_reduction;
