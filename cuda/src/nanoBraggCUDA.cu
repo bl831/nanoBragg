@@ -12,6 +12,7 @@
 #include <numeric>
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include <driver_types.h>
 #include "nanotypes.h"
 #include "nanoBraggCUDA.h"
@@ -60,6 +61,7 @@ struct vector3 {
 struct constParams {
     CUDAREAL Avogadro;
     CUDAREAL r_e_sqr;
+    int hkl_precision; /* NB_HKL_PRECISION: 1=double geometry+sincg (default), 0=single-precision baseline */
 };
 
 struct beamSource {
@@ -324,6 +326,17 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     constParams constants;
     constants.Avogadro = Avogadro;
     constants.r_e_sqr = r_e_sqr;
+    /* NB_HKL_PRECISION selects the h,k,l / scattering / sincg math precision:
+       "double" (default) = double-precision geometry + sincg, the correctness fix for the
+       sharp-sincg precision bug (matches the root nanoBragg.c double oracle); "single" (alias
+       "float") = the legacy single-precision baseline, kept for A/B and perf comparison.
+       Default = double (accuracy first). */
+    constants.hkl_precision = 1; /* double by default */
+    {
+        const char * hkl_prec_env = getenv("NB_HKL_PRECISION");
+        if (hkl_prec_env && (strcmp(hkl_prec_env, "single") == 0 || strcmp(hkl_prec_env, "float") == 0))
+            constants.hkl_precision = 0;
+    }
 
     detectorParams * cu_detector;
     CUDA_CHECK_RETURN(cudaMalloc((void ** )&cu_detector, sizeof(*cu_detector)));
@@ -519,6 +532,7 @@ CUDAREAL scale);
 __device__ __inline__ void rotate_umat_ldg(CUDAREAL * v, CUDAREAL *newv, const matrix3x3 * umat);
 /* Fourier transform of a truncated lattice */
 __device__ __inline__ static CUDAREAL sincg(CUDAREAL x, CUDAREAL N);
+__device__ __inline__ static double sincg_double(double x, double N);
 /* Fourier transform of a sphere */
 __device__ static CUDAREAL sinc3(CUDAREAL x);
 /* polarization factor from vectors */
@@ -805,15 +819,15 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
             }
         }
 
-        /* reset photon count for this pixel */
-        CUDAREAL I = I_bg;
+        /* photon accumulator. Water background (I_bg) is not seeded here; it is added
+           at the first sub-pixel below, scaled by that pixel's solid angle, so it
+           tracks the CPU reference. Folding it into I keeps the kernel register-neutral. */
+        CUDAREAL I = 0.0;
         CUDAREAL omega_sub_reduction = 0.0;
         CUDAREAL max_I_x_sub_reduction = 0.0;
         CUDAREAL max_I_y_sub_reduction = 0.0;
-        CUDAREAL polar = 0.0;
-        if (beam->calc_polar) {
-            polar = 1.0;
-        }
+        CUDAREAL polar = 1.0;
+        bool polar_computed = false;
 
         /* add this now to avoid problems with skipping later */
         // move this to the bottom to avoid accessing global device memory. floatimage[j] = I_bg;
@@ -868,6 +882,14 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
                                 - exp(-(thick_tic + 1) * detector->detector_thickstep * detector->detector_mu / parallax);
                     }
 
+                    /* Add the water background once, scaled by this sub-pixel's solid
+                       angle and capture fraction, so it tracks the CPU reference (which
+                       scales the whole pixel intensity by omega, water included). A no-op
+                       when there is no water (I_bg == 0). */
+                    if (subS == 0 && subF == 0 && thick_tic == 0) {
+                        I += capture_fraction * omega_pixel * I_bg;
+                    }
+
                     /* loop over sources now */
                     for (short source = 0; source < beam->sources; ++source) {
 
@@ -884,6 +906,17 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
                         /* sin(theta)/lambda is half the scattering vector length */
                         CUDAREAL stol = (CUDAREAL)0.5 * norm3d_fma_rn(scattering[1], scattering[2], scattering[3]);
 
+                        /* --- NB_HKL_PRECISION: double-precision scattering representation for the h,k,l precision fix --- */
+                        const bool use_double = (constants->hkl_precision != 0);
+                        double sc_d[4];
+                        if (use_double) {
+                            /* double-precision scattering vector — matches root nanoBragg.c */
+                            const double invl = 1.0 / (double) lambda;
+                            sc_d[1] = ((double) diffracted[1] - (double) __ldg(&beam_sources[source].neg_unit_source_vector[1])) * invl;
+                            sc_d[2] = ((double) diffracted[2] - (double) __ldg(&beam_sources[source].neg_unit_source_vector[2])) * invl;
+                            sc_d[3] = ((double) diffracted[3] - (double) __ldg(&beam_sources[source].neg_unit_source_vector[3])) * invl;
+                        }
+
                         /* rough cut to speed things up when we aren't using whole detector */
                         if (crystal->dmin > 0.0 && stol > 0.0) {
                             if (crystal->dmin > 0.5f / stol) {
@@ -892,13 +925,17 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
                         }
 
                         /* polarization factor */
-                        if (beam->calc_polar) {
+                        /* Compute the polarization factor once per pixel (from the first
+                           source) and reuse it, matching the CPU oracle; the boolean flag
+                           keeps the guard uniform across the warp (no divergence). */
+                        if (beam->calc_polar && !polar_computed) {
                             /* need to compute polarization factor */
                             CUDAREAL incident[4];
                             incident[1] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
-                            incident[2] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
-                            incident[3] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
+                            incident[2] = __ldg(&beam_sources[source].neg_unit_source_vector[2]);
+                            incident[3] = __ldg(&beam_sources[source].neg_unit_source_vector[3]);
                             polar = polarization_factor(beam->polarization, incident, diffracted, beam->polar_vector);
+                            polar_computed = true;
                         }
 
                         /* sweep over phi angles */
@@ -944,14 +981,27 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
 
                                 /* construct fractional Miller indicies */
 
-                                CUDAREAL h = dot_product(a, scattering);
-                                CUDAREAL k = dot_product(b, scattering);
-                                CUDAREAL l = dot_product(c, scattering);
-
-                                /* round off to nearest whole index */
-                                short h0 = ceil(h - (CUDAREAL)0.5);
-                                short k0 = ceil(k - (CUDAREAL)0.5);
-                                short l0 = ceil(l - (CUDAREAL)0.5);
+                                CUDAREAL h, k, l;
+                                short h0, k0, l0;
+                                double hd = 0.0, kd = 0.0, ld = 0.0;
+                                if (use_double) {
+                                    /* double-precision Miller indices to match the root double oracle */
+                                    hd = (double) a[1] * sc_d[1] + (double) a[2] * sc_d[2] + (double) a[3] * sc_d[3];
+                                    kd = (double) b[1] * sc_d[1] + (double) b[2] * sc_d[2] + (double) b[3] * sc_d[3];
+                                    ld = (double) c[1] * sc_d[1] + (double) c[2] * sc_d[2] + (double) c[3] * sc_d[3];
+                                    h = (CUDAREAL) hd; k = (CUDAREAL) kd; l = (CUDAREAL) ld;
+                                    h0 = (short) ceil(hd - 0.5);
+                                    k0 = (short) ceil(kd - 0.5);
+                                    l0 = (short) ceil(ld - 0.5);
+                                } else {
+                                    /* single-precision baseline (bit-identical to the locked reference) */
+                                    h = dot_product(a, scattering);
+                                    k = dot_product(b, scattering);
+                                    l = dot_product(c, scattering);
+                                    h0 = ceil(h - (CUDAREAL)0.5);
+                                    k0 = ceil(k - (CUDAREAL)0.5);
+                                    l0 = ceil(l - (CUDAREAL)0.5);
+                                }
 
                                 /* structure factor of the lattice (paralelpiped crystal)
                                  F_latt = sin(M_PI*Na*h)*sin(M_PI*Nb*k)*sin(M_PI*Nc*l)/sin(M_PI*h)/sin(M_PI*k)/sin(M_PI*l);
@@ -959,14 +1009,21 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
                                 CUDAREAL F_latt = 1.0; // Shape transform for the crystal.
                                 if (crystal->xtal_shape == SQUARE) {
                                     /* xtal is a paralelpiped */
-                                    if (crystal->Na > 1) {
-                                        F_latt *= sincg((CUDAREAL)M_PI * h, crystal->Na);
-                                    }
-                                    if (crystal->Nb > 1) {
-                                        F_latt *= sincg((CUDAREAL)M_PI * k, crystal->Nb);
-                                    }
-                                    if (crystal->Nc > 1) {
-                                        F_latt *= sincg((CUDAREAL)M_PI * l, crystal->Nc);
+                                    if (use_double) {
+                                        /* double sincg on the double Miller indices */
+                                        if (crystal->Na > 1) F_latt *= (CUDAREAL) sincg_double(M_PI * hd, (double) crystal->Na);
+                                        if (crystal->Nb > 1) F_latt *= (CUDAREAL) sincg_double(M_PI * kd, (double) crystal->Nb);
+                                        if (crystal->Nc > 1) F_latt *= (CUDAREAL) sincg_double(M_PI * ld, (double) crystal->Nc);
+                                    } else {
+                                        if (crystal->Na > 1) {
+                                            F_latt *= sincg((CUDAREAL)M_PI * h, crystal->Na);
+                                        }
+                                        if (crystal->Nb > 1) {
+                                            F_latt *= sincg((CUDAREAL)M_PI * k, crystal->Nb);
+                                        }
+                                        if (crystal->Nc > 1) {
+                                            F_latt *= sincg((CUDAREAL)M_PI * l, crystal->Nc);
+                                        }
                                     }
                                 } else if (crystal->xtal_shape == ROUND) {
                                     /* use sinc3 for elliptical xtal shape,
@@ -1021,7 +1078,9 @@ __global__ void nanoBraggSpotsCUDAKernel_CC9_0(const detectorParams * __restrict
             /* end of sub-pixel y loop */
         }
         /* end of sub-pixel x loop */
-        const double photons = I_bg + (constants->r_e_sqr * beam->fluence * polar * I) / detector->steps;
+        /* I holds the Bragg sum plus the solid-angle-scaled water background; apply
+           polarization and normalize by the sub-step count. */
+        const double photons = (constants->r_e_sqr * beam->fluence * polar * I) / detector->steps;
         floatimage[j] = photons;
         omega_reduction[j] = omega_sub_reduction; // shared contention
         max_I_x_reduction[j] = max_I_x_sub_reduction;
@@ -1211,6 +1270,13 @@ __device__ CUDAREAL sincg(CUDAREAL x, CUDAREAL N) {
 
     return N;
 
+}
+
+/* double-precision sincg, used when NB_HKL_PRECISION=double to match the root double oracle */
+__device__ __inline__ static double sincg_double(double x, double N) {
+    if (x != 0.0)
+        return sin(x * N) / sin(x);
+    return N;
 }
 
 /* Fourier transform of a sphere */
