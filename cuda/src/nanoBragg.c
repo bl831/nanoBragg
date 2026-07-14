@@ -313,6 +313,10 @@ int main(int argc, char** argv)
 
     /* interpolation arrays */
     int interpolate = 2;
+    int explicit_interpolate = 0; /* GPU guard: 1 if user passed -interpolate on the CLI */
+    /* GPU guard: distinguish "-oversample_thick not set" from an explicit value */
+    int oversample_thick_set = 0;
+    int oversample_thick_val = 0;
     double ***sub_Fhkl;
     int    h_interp[5],k_interp[5],l_interp[5];
     double h_interp_d[5],k_interp_d[5],l_interp_d[5];
@@ -741,11 +745,11 @@ int main(int argc, char** argv)
             {
                 fpixels = spixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-detpixels_f") && (argc > (i+1)))
+            if((strstr(argv[i], "-detpixels_f") || strstr(argv[i], "-detpixels_x")) && (argc > (i+1)))
             {
                 fpixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-detpixels_s") && (argc > (i+1)))
+            if((strstr(argv[i], "-detpixels_s") || strstr(argv[i], "-detpixels_y")) && (argc > (i+1)))
             {
                 spixels = atoi(argv[i+1]);
             }
@@ -769,6 +773,25 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-nopolar") )
             {
                 nopolar = 1;
+            }
+            if(strstr(argv[i], "-oversample_thick"))
+            {
+                /* GPU guard: the GPU always uses its accurate per-layer detector
+                   thickness model. Record that the flag was set and any explicit
+                   value so we can reject the unsupported -oversample_thick 0
+                   request before launch. Bare flag == enabled (root semantics).
+                   continue so the -oversample parse below does not clobber
+                   'oversample' with this flag's value. */
+                oversample_thick_set = 1;
+                if((argc > (i+1)) && (argv[i+1][0] >= '0' && argv[i+1][0] <= '9'))
+                {
+                    oversample_thick_val = atoi(argv[i+1]);
+                }
+                else
+                {
+                    oversample_thick_val = 1;
+                }
+                continue;
             }
             if(strstr(argv[i], "-oversample") && (argc > (i+1)))
             {
@@ -988,6 +1011,7 @@ int main(int argc, char** argv)
             {
                 /* turn on tricubic interpolation */
                 interpolate = 1;
+                explicit_interpolate = 1; /* GPU guard: user asked for it explicitly */
             }
             if(strstr(argv[i], "-nointerpolate") )
             {
@@ -2427,6 +2451,63 @@ int main(int argc, char** argv)
         printf("  water droplet size: %g m\n",water_size);
     }
 
+
+    /* ------------------------------------------------------------------ */
+    /* GPU capability guards: error-and-stop before launch on requests the */
+    /* CUDA kernel cannot honor, rather than silently emitting a wrong     */
+    /* image. Notices are printed once (host runs this block once).        */
+    /* ------------------------------------------------------------------ */
+
+    /* GAUSS/TOPHAT (incl. -binary_spots, which maps to TOPHAT) spot shapes are
+       unsupported on the GPU: the kernel still uses a pre-2023 spot-profile metric
+       (hrad_sqr) that diverges substantially from the current CPU reference
+       (JMHolton's 2023 rad_star_sqr). SQUARE and ROUND are supported. */
+    if(xtal_shape == GAUSS || xtal_shape == TOPHAT)
+    {
+        printf("ERROR: GAUSS/TOPHAT spot shapes aren't supported on the GPU yet.\n"
+               "       Use the CPU nanoBragg for -gauss_xtal / -tophat_spots / -binary_spots.\n");
+        exit(9);
+    }
+
+    /* Tricubic structure-factor interpolation is unwired on the GPU (the kernel
+       only does nearest-neighbor lookup). Refuse an EXPLICIT -interpolate; the
+       auto-enabled small-crystal case is handled by a notice below. */
+    if(explicit_interpolate)
+    {
+        printf("ERROR: -interpolate (tricubic Fhkl interpolation) isn't supported on the\n"
+               "       GPU yet. The GPU does nearest-neighbor lookup; use the CPU nanoBragg.\n");
+        exit(9);
+    }
+
+    /* Detector-thickness oversampling: the GPU always uses its accurate per-layer
+       model. An EXPLICIT -oversample_thick 0 (the CPU's single-layer approximation)
+       cannot be honored; a plain run (flag not set, or -oversample_thick 1) is fine. */
+    if(oversample_thick_set && oversample_thick_val == 0)
+    {
+        printf("ERROR: -oversample_thick 0 isn't supported on the GPU. It always uses the\n"
+               "       accurate per-layer model; omit the flag, or use the CPU nanoBragg.\n");
+        exit(9);
+    }
+
+    /* -fudge is ignored by the GPU kernel: F_latt hardcodes fudge=1.0 in the
+       lattice-shape transform. A non-default -fudge on any crystal shape would
+       silently produce a wrong image -> refuse it. Placed after the GAUSS/TOPHAT
+       check so those shapes still hit their own message first. */
+    if(fudge != 1.0)
+    {
+        printf("ERROR: -fudge isn't supported on the GPU yet (the kernel hardcodes\n"
+               "       fudge=1.0). Use the CPU nanoBragg for a non-default -fudge.\n");
+        exit(9);
+    }
+
+    /* Proceed notices (only reached once we are actually going to launch). */
+    if(interpolate)
+    {
+        printf("WARNING: GPU does not support structure-factor interpolation; using\n"
+               "         nearest-neighbor Fhkl lookup.\n");
+    }
+    printf("WARNING: GPU uses its accurate per-layer detector-thickness model\n"
+           "         (oversample_thick behavior).\n");
 
     /* sweep over detector */
     sum = sumsqr = 0.0;
