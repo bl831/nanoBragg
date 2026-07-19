@@ -313,6 +313,10 @@ int main(int argc, char** argv)
 
     /* interpolation arrays */
     int interpolate = 2;
+    int explicit_interpolate = 0; /* GPU guard: 1 if user passed -interpolate on the CLI */
+    /* GPU guard: distinguish "-oversample_thick not set" from an explicit value */
+    int oversample_thick_set = 0;
+    int oversample_thick_val = 0;
     double ***sub_Fhkl;
     int    h_interp[5],k_interp[5],l_interp[5];
     double h_interp_d[5],k_interp_d[5],l_interp_d[5];
@@ -741,11 +745,11 @@ int main(int argc, char** argv)
             {
                 fpixels = spixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-detpixels_f") && (argc > (i+1)))
+            if((strstr(argv[i], "-detpixels_f") || strstr(argv[i], "-detpixels_x")) && (argc > (i+1)))
             {
                 fpixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-detpixels_s") && (argc > (i+1)))
+            if((strstr(argv[i], "-detpixels_s") || strstr(argv[i], "-detpixels_y")) && (argc > (i+1)))
             {
                 spixels = atoi(argv[i+1]);
             }
@@ -769,6 +773,25 @@ int main(int argc, char** argv)
             if(strstr(argv[i], "-nopolar") )
             {
                 nopolar = 1;
+            }
+            if(strstr(argv[i], "-oversample_thick"))
+            {
+                /* GPU guard: the GPU always uses its accurate per-layer detector
+                   thickness model. Record that the flag was set and any explicit
+                   value so we can reject the unsupported -oversample_thick 0
+                   request before launch. Bare flag == enabled (root semantics).
+                   continue so the -oversample parse below does not clobber
+                   'oversample' with this flag's value. */
+                oversample_thick_set = 1;
+                if((argc > (i+1)) && (argv[i+1][0] >= '0' && argv[i+1][0] <= '9'))
+                {
+                    oversample_thick_val = atoi(argv[i+1]);
+                }
+                else
+                {
+                    oversample_thick_val = 1;
+                }
+                continue;
             }
             if(strstr(argv[i], "-oversample") && (argc > (i+1)))
             {
@@ -988,6 +1011,7 @@ int main(int argc, char** argv)
             {
                 /* turn on tricubic interpolation */
                 interpolate = 1;
+                explicit_interpolate = 1; /* GPU guard: user asked for it explicitly */
             }
             if(strstr(argv[i], "-nointerpolate") )
             {
@@ -1227,7 +1251,7 @@ int main(int argc, char** argv)
         printf("\t-N               \tnumber of unit cells in all directions. may also use -Na -Nb or -Nc\n");
         printf("\t-square_xtal     \tspecify parallelpiped crystal shape (default)\n");
         printf("\t-round_xtal      \tspecify ellipsoidal crystal shape (sort of)\n");
-        printf("\t-tophat_spots    \tclip lattice transform at fwhm: no inter-Bragg maxima\n");
+        printf("\t-tophat_spots    \tclip lattice transform at fwhm: no inter-Bragg maxima (not supported on GPU)\n");
         printf("\t-oversample      \tnumber of sub-pixels per pixel. use this if xtalsize/lambda > distance/pixel\n");
         printf("\t-lambda          \tincident x-ray wavelength in Angstrom. may also use -energy in eV\n");
         printf("\t-mosaic          \tisotropic mosaic spread in degrees (use 90 for powder)\n");
@@ -1255,7 +1279,7 @@ int main(int argc, char** argv)
         printf("\t-noprogress      \tturn off the progress meter\n");
         printf("\t-nopolar         \tturn off the polarization correction\n");
         printf("\t-nointerpolate   \tdisable inter-Bragg peak structure factor interpolation\n");
-        printf("\t-interpolate     \tforce inter-Bragg peak structure factor interpolation (default: on if < 3 cells wide)\n");
+        printf("\t-interpolate     \tforce inter-Bragg peak structure factor interpolation (default: on if < 3 cells wide) (not supported on GPU)\n");
         printf("\t-point_pixel     \tturn off the pixel solid angle correction\n");
         printf("\t-curved_det      \tall pixels same distance from crystal\n");
         printf("\t-fdet_vector     \tunit vector of increasing fast-axis detector pixel coordinate (default: %g %g %g)\n",fdet_vector[1],fdet_vector[2],fdet_vector[3]);
@@ -1265,15 +1289,12 @@ int main(int argc, char** argv)
         printf("\t-polar_vector    \tunit vector of x-ray E-vector polarization (default: %g %g %g)\n",polar_vector[1],polar_vector[2],polar_vector[3]);
         printf("\t-spindle_axis    \tunit vector of right-handed phi rotation axis (default: %g %g %g)\n",spindle_vector[1],spindle_vector[2],spindle_vector[3]);
         printf("\t-pix0_vector     \tvector from crystal to first pixel in image (default: beam centered on detector)\n");
-//        printf("\t-source_distance \tdistance of x-ray source from crystal (default: 10 meters)\n");
         exit(9);
     }
 
 
     /* allocate detector memory */
     floatimage = (float*) calloc(pixels+10,sizeof(float));
-    //sinimage = (float*) calloc(pixels+10,2*sizeof(float));
-    //cosimage = (float*) calloc(pixels+10,2*sizeof(float));
     intimage   = (unsigned short int*) calloc(pixels+10,sizeof(unsigned short int));
     if(write_pgm) pgmimage   = (unsigned char*) calloc(pixels+10,sizeof(unsigned char));
 
@@ -2134,22 +2155,6 @@ int main(int argc, char** argv)
         }
         fclose(infile);
 
-//      for(h0=h_min;h0<=h_max;++h0){
-//          for(k0=k_min;k0<=k_max;++k0){
-//              for(l0=l_min;l0<=l_max;++l0){
-//                  if ( (h0<=h_max) && (h0>=h_min) && (k0<=k_max) && (k0>=k_min) && (l0<=l_max) && (l0>=l_min)  ) {
-//                      /* just take nearest-neighbor */
-//                      F_cell = Fhkl[h0-h_min][k0-k_min][l0-l_min];
-//                  }
-//                  else
-//                  {
-//                      F_cell = 0.0;
-//                  }
-//                  printf("%d %d %d = %f\n",h0,k0,l0,F_cell);
-//              }
-//          }
-//      }
-
         /* make dump file */
         outfile = fopen(dumpfilename,"wb");
         if(outfile == NULL)
@@ -2239,8 +2244,6 @@ int main(int argc, char** argv)
         phi = phi0 + phistep*phi_tic;
         printf("phi%d = %g\n",phi_tic,phi*RTD);
     }
-
-
 
 
     /* import sources from user file */
@@ -2427,6 +2430,75 @@ int main(int argc, char** argv)
         printf("  water droplet size: %g m\n",water_size);
     }
 
+
+    /* ------------------------------------------------------------------ */
+    /* GPU capability guards: error-and-stop before launch on requests the */
+    /* CUDA kernel cannot honor, rather than silently emitting a wrong     */
+    /* image. Notices are printed once (host runs this block once).        */
+    /* ------------------------------------------------------------------ */
+
+    /* GAUSS/TOPHAT (incl. -binary_spots, which maps to TOPHAT) spot shapes are
+       unsupported on the GPU: the kernel still uses a pre-2023 spot-profile metric
+       (hrad_sqr) that diverges substantially from the current CPU reference
+       (JMHolton's 2023 rad_star_sqr). SQUARE and ROUND are supported. */
+    if(xtal_shape == GAUSS || xtal_shape == TOPHAT)
+    {
+        printf("ERROR: GAUSS/TOPHAT spot shapes aren't supported on the GPU yet.\n"
+               "       Use the CPU nanoBragg for -gauss_xtal / -tophat_spots / -binary_spots.\n");
+        exit(9);
+    }
+
+    /* Tricubic structure-factor interpolation is unwired on the GPU (the kernel
+       only does nearest-neighbor lookup). Refuse an EXPLICIT -interpolate; the
+       auto-enabled small-crystal case is handled by a notice below. */
+    if(explicit_interpolate)
+    {
+        printf("ERROR: -interpolate (tricubic Fhkl interpolation) isn't supported on the\n"
+               "       GPU yet. The GPU does nearest-neighbor lookup; use the CPU nanoBragg.\n");
+        exit(9);
+    }
+
+    /* Detector-thickness oversampling: the GPU always uses its accurate per-layer
+       model. An EXPLICIT -oversample_thick 0 (the CPU's single-layer approximation)
+       cannot be honored; a plain run (flag not set, or -oversample_thick 1) is fine. */
+    if(oversample_thick_set && oversample_thick_val == 0)
+    {
+        printf("ERROR: -oversample_thick 0 isn't supported on the GPU. It always uses the\n"
+               "       accurate per-layer model; omit the flag, or use the CPU nanoBragg.\n");
+        exit(9);
+    } else if(detector_thicksteps > 1 && !oversample_thick_set) {
+        printf("WARNING: GPU uses its accurate per-layer detector-thickness model\n"
+               "         (-oversample_thick 1 behavior).\n");
+    }
+
+    /* -fudge is ignored by the GPU kernel: F_latt hardcodes fudge=1.0 in the
+       lattice-shape transform. A non-default -fudge on any crystal shape would
+       silently produce a wrong image -> refuse it. Placed after the GAUSS/TOPHAT
+       check so those shapes still hit their own message first. */
+    if(fudge != 1.0)
+    {
+        printf("ERROR: -fudge isn't supported on the GPU yet.\n"
+               "       Use the CPU nanoBragg instead.\n");
+        exit(9);
+    }
+
+    /* Proceed notices (only reached once we are actually going to launch). */
+    if(interpolate)
+    {
+        printf("WARNING: GPU does not support structure-factor interpolation; using\n"
+               "         nearest-neighbor Fhkl lookup.\n");
+    }
+
+    /* -stol/-4stol/-Q supply a resolution-dependent amorphous-background table.
+       The GPU kernel does not consume it: it renders a flat water_F background.
+       The current CPU reference does the same, so the GPU output already MATCHES
+       the CPU -- this is a disclosure so the flag isn't silently ignored, not a
+       rejection. Printed once (host runs this block once). */
+    if(stolfilename != NULL)
+    {
+        printf("ERROR: -stol/-4stol/-Q is not supported ont the GPU yet.\n"
+               "       Use the CPU nanoBragg instead.\n");
+    }
 
     /* sweep over detector */
     sum = sumsqr = 0.0;
