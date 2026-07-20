@@ -2496,8 +2496,9 @@ int main(int argc, char** argv)
        rejection. Printed once (host runs this block once). */
     if(stolfilename != NULL)
     {
-        printf("ERROR: -stol/-4stol/-Q is not supported ont the GPU yet.\n"
+        printf("ERROR: -stol/-4stol/-Q is not supported on the GPU yet.\n"
                "       Use the CPU nanoBragg instead.\n");
+        exit(9);
     }
 
     /* sweep over detector */
