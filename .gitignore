@@ -1,0 +1,5 @@
+# Render/test outputs — never commit these, from any directory.
+Fdump.bin
+floatimage.bin
+intimage.img
+image.pgm
