@@ -214,8 +214,8 @@ int main(int argc, char** argv)
     double airpath,omega_pixel,omega_Rsqr_pixel,omega_sum;
     int curved_detector = 0;
     int point_pixel= 0;
-    /* device arithmetic precision: 0 = single (default), 1 = df64 (see -precision) */
-    int precision_double = 0;
+    /* device arithmetic precision: 0 = single, 1 = df64 (default) (see -precision) */
+    int precision_double = 1;
     /* beam center value that goes into the image header */
     double Xbeam=NAN,Ybeam=NAN;
     /* direct beam coordinate on fast/slow pixel axes; used for diffraction if pivot=beam */
@@ -1292,7 +1292,7 @@ int main(int argc, char** argv)
         printf("\t-nopolar         \tturn off the polarization correction\n");
         printf("\t-nointerpolate   \tdisable inter-Bragg peak structure factor interpolation\n");
         printf("\t-interpolate     \tforce inter-Bragg peak structure factor interpolation (default: on if < 3 cells wide) (not supported on GPU)\n");
-        printf("\t-precision       \tGPU compute precision: single or double. double approximates the CPU reference but takes longer (default: single)\n");
+        printf("\t-precision       \tGPU compute precision: single or double. double approximates the CPU reference but takes longer (default: double)\n");
         printf("\t-point_pixel     \tturn off the pixel solid angle correction\n");
         printf("\t-curved_det      \tall pixels same distance from crystal\n");
         printf("\t-fdet_vector     \tunit vector of increasing fast-axis detector pixel coordinate (default: %g %g %g)\n",fdet_vector[1],fdet_vector[2],fdet_vector[3]);

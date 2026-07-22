@@ -51,7 +51,7 @@
 #define NB_PREC_SINGLE 1
 #define NB_PREC_DF64   2
 #ifndef NB_PRECISION
-#define NB_PRECISION NB_PREC_SINGLE
+#define NB_PRECISION NB_PREC_DF64
 #endif
 #if   NB_PRECISION == NB_PREC_SINGLE
 typedef float  Real;
