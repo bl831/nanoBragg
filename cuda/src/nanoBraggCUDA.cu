@@ -1413,12 +1413,42 @@ __device__ __inline__ static float parallax(const float2 * __restrict__ odet, co
     return real_to_float(__ldg(&odet[1])) * diffracted_f[1] + real_to_float(__ldg(&odet[2])) * diffracted_f[2] + real_to_float(__ldg(&odet[3])) * diffracted_f[3];
 }
 
+/* compensated-pair form of the axis rotation: rotate the (hi, lo) vector v about the
+   (hi, lo) unit axis by angle phi, writing the (hi, lo) result into newv. The trig
+   constants sin(phi)/cos(phi) are single-precision scalars (one sin and one cos, as in
+   the float rotate_axis); every vector product and sum is carried as a compensated pair
+   so the rotated position keeps its low word instead of collapsing to float. Mirrors the
+   float rotate_axis term for term:
+       newv = v*cos + (axis x v)*sin + axis*(axis . v)*(1 - cos)
+   4-element convention, element 0 (magnitude) left untouched. */
+__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float phi) {
+    const float sinphi = sin(phi);
+    const float cosphi = cos(phi);
+    const float2 a1 = axis[1];
+    const float2 a2 = axis[2];
+    const float2 a3 = axis[3];
+    const float2 v1 = v[1];
+    const float2 v2 = v[2];
+    const float2 v3 = v[3];
+    float2 dot = df_add(df_add(df_mul(a1, v1), df_mul(a2, v2)), df_mul(a3, v3));
+    dot = df_mul_f(dot, 1.0f - cosphi);
+
+    newv[1] = df_add(df_add(df_mul(a1, dot), df_mul_f(v1, cosphi)),
+                     df_mul_f(df_sub(df_mul(a2, v3), df_mul(a3, v2)), sinphi));
+    newv[2] = df_add(df_add(df_mul(a2, dot), df_mul_f(v2, cosphi)),
+                     df_mul_f(df_sub(df_mul(a3, v1), df_mul(a1, v3)), sinphi));
+    newv[3] = df_add(df_add(df_mul(a3, dot), df_mul_f(v3, cosphi)),
+                     df_mul_f(df_sub(df_mul(a1, v2), df_mul(a2, v1)), sinphi));
+}
+
 /* curved-detector pixel rotation: construct a detector pixel that is always "distance"
    from the sample by rotating pixel_pos about sdet_vector then fdet_vector. The float
    form is the base kernel's exact rotation, operating directly on pixel_pos. The df64
-   form narrows pixel_pos/sdet_vector/fdet_vector to float, performs the same two
-   rotations in the same order, then widens the result back into pixel_pos (an exact
-   widening of a float-exact value). */
+   form carries the rotation in the compensated pair representation: the rotation angles
+   are the same single-precision pixel_pos[2]/distance and pixel_pos[3]/distance the float
+   form uses (and the sin/cos are single-precision scalars inside rotate_axis), but the
+   vector being rotated and the sdet/fdet basis stay (hi, lo) pairs, so the rotated pixel
+   position keeps its low word rather than collapsing to float across the rotation. */
 __device__ __inline__ static void curved_position(const float * sdet_vector, const float * fdet_vector, float distance,
         const float * dbvector, float * pixel_pos) {
     float newvector[4];
@@ -1427,20 +1457,21 @@ __device__ __inline__ static void curved_position(const float * sdet_vector, con
 }
 __device__ __inline__ static void curved_position(const float2 * sdet_vector, const float2 * fdet_vector, float distance,
         const float * dbvector, float2 * pixel_pos) {
-    float ppos_f[4] = { real_to_float(pixel_pos[0]), real_to_float(pixel_pos[1]), real_to_float(pixel_pos[2]), real_to_float(pixel_pos[3]) };
-    float sdet_f[4] = { real_to_float(sdet_vector[0]), real_to_float(sdet_vector[1]), real_to_float(sdet_vector[2]), real_to_float(sdet_vector[3]) };
-    float fdet_f[4] = { real_to_float(fdet_vector[0]), real_to_float(fdet_vector[1]), real_to_float(fdet_vector[2]), real_to_float(fdet_vector[3]) };
-    float newvector[4];
-    rotate_axis(dbvector, newvector, sdet_f, ppos_f[2] / distance);
-    rotate_axis(newvector, ppos_f, fdet_f, ppos_f[3] / distance);
-    /* this overload only ever runs when Real is float2, so the widen-back calls
-       make_real_double directly rather than through the NB_PRECISION-aliased name:
-       this function body is unconditionally compiled at both precisions (like every
-       float2 overload in this file), and the alias tracks the active compile pass,
-       not which overload is executing it. */
-    pixel_pos[1] = make_real_double(ppos_f[1]);
-    pixel_pos[2] = make_real_double(ppos_f[2]);
-    pixel_pos[3] = make_real_double(ppos_f[3]);
+    /* rotation angles from the high word of the compensated pixel position, matching the
+       float form's pixel_pos[2]/distance and pixel_pos[3]/distance exactly. */
+    const float phi_s = real_to_float(pixel_pos[2]) / distance;
+    const float phi_f = real_to_float(pixel_pos[3]) / distance;
+    /* dbvector is the single-precision sample->distance * beam_vector input; widen it to
+       compensated pairs so the whole rotation runs in the pair representation. sdet_vector
+       and fdet_vector are already Real (float2) here, so they enter the rotation as pairs
+       instead of being narrowed to float. */
+    float2 dbv[4];
+    dbv[1] = make_real_double(dbvector[1]);
+    dbv[2] = make_real_double(dbvector[2]);
+    dbv[3] = make_real_double(dbvector[3]);
+    float2 newvector[4];
+    rotate_axis(dbv, newvector, sdet_vector, phi_s);
+    rotate_axis(newvector, pixel_pos, fdet_vector, phi_f);
 }
 
 /* make a unit vector pointing in same direction and report magnitude (both args can
