@@ -37,23 +37,24 @@ RELEASE_CFLAGS = $(COMMON_CFLAGS) -O3 -v
 DEBUG_NVCC_FLAGS = -g -G -v $(NVCC_FLAGS) # Debug symbols for CUDA + verbose
 RELEASE_NVCC_FLAGS = -lineinfo -O3 -v $(NVCC_FLAGS)
 
-# Object files
-OBJS = nanoBragg.o nanoBraggCPU.o nanoBraggCUDA.cu.o
-
 # Default target: build both debug and release
 all: debug release
 
 debug: | $(DEBUG_DIR)
 	$(CC) $(DEBUG_CFLAGS) -c $(SRC_DIR)/nanoBragg.c -o $(DEBUG_DIR)/nanoBragg.o
 	$(CC) $(DEBUG_CFLAGS) -c $(SRC_DIR)/nanoBraggCPU.c -o $(DEBUG_DIR)/nanoBraggCPU.o
-	$(NVCC) $(DEBUG_NVCC_FLAGS) -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(DEBUG_DIR)/nanoBraggCUDA.cu.o $(COMMON_CFLAGS)
-	g++ $(STATIC_LDFLAGS) $(DEBUG_DIR)/nanoBragg.o $(DEBUG_DIR)/nanoBraggCPU.o $(DEBUG_DIR)/nanoBraggCUDA.cu.o -o $(DEBUG_DIR)/nanoBraggCUDA $(LDFLAGS)
+	# kernel compiled once per device precision; both objects link into the binary
+	$(NVCC) $(DEBUG_NVCC_FLAGS) -DNB_PRECISION=1 -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(DEBUG_DIR)/nanoBraggCUDA_single.cu.o $(COMMON_CFLAGS)
+	$(NVCC) $(DEBUG_NVCC_FLAGS) -DNB_PRECISION=2 -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(DEBUG_DIR)/nanoBraggCUDA_double.cu.o $(COMMON_CFLAGS)
+	g++ $(STATIC_LDFLAGS) $(DEBUG_DIR)/nanoBragg.o $(DEBUG_DIR)/nanoBraggCPU.o $(DEBUG_DIR)/nanoBraggCUDA_single.cu.o $(DEBUG_DIR)/nanoBraggCUDA_double.cu.o -o $(DEBUG_DIR)/nanoBraggCUDA $(LDFLAGS)
 
 release: | $(RELEASE_DIR)
 	$(CC) $(RELEASE_CFLAGS) -c $(SRC_DIR)/nanoBragg.c -o $(RELEASE_DIR)/nanoBragg.o
 	$(CC) $(RELEASE_CFLAGS) -c $(SRC_DIR)/nanoBraggCPU.c -o $(RELEASE_DIR)/nanoBraggCPU.o
-	$(NVCC) $(RELEASE_NVCC_FLAGS) -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(RELEASE_DIR)/nanoBraggCUDA.cu.o $(COMMON_CFLAGS)
-	g++ $(STATIC_LDFLAGS) $(RELEASE_DIR)/nanoBragg.o $(RELEASE_DIR)/nanoBraggCPU.o $(RELEASE_DIR)/nanoBraggCUDA.cu.o -o $(RELEASE_DIR)/nanoBraggCUDA $(LDFLAGS)
+	# kernel compiled once per device precision; both objects link into the binary
+	$(NVCC) $(RELEASE_NVCC_FLAGS) -DNB_PRECISION=1 -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(RELEASE_DIR)/nanoBraggCUDA_single.cu.o $(COMMON_CFLAGS)
+	$(NVCC) $(RELEASE_NVCC_FLAGS) -DNB_PRECISION=2 -c $(SRC_DIR)/nanoBraggCUDA.cu -o $(RELEASE_DIR)/nanoBraggCUDA_double.cu.o $(COMMON_CFLAGS)
+	g++ $(STATIC_LDFLAGS) $(RELEASE_DIR)/nanoBragg.o $(RELEASE_DIR)/nanoBraggCPU.o $(RELEASE_DIR)/nanoBraggCUDA_single.cu.o $(RELEASE_DIR)/nanoBraggCUDA_double.cu.o -o $(RELEASE_DIR)/nanoBraggCUDA $(LDFLAGS)
 
 $(DEBUG_DIR):
 	mkdir -p $(DEBUG_DIR)
