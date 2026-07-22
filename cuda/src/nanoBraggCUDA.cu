@@ -1236,15 +1236,49 @@ __device__ __inline__ static float dot_product(const float * x, const float * y)
     return x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
 }
 
-/* compensated projection of a scattering vector onto a cell vector to form one
-   Miller index: accumulate the three (hi, lo) products into a running (hi, lo) sum,
-   keeping the full width of every partial. 4-element convention, element 0 unused. */
+/* Compensated dot product of two 3-vectors whose components are (hi, lo) float
+   pairs -- forms one Miller index (x . y) to near-double accuracy using only
+   float arithmetic. 4-element convention, element 0 unused. */
 __device__ __inline__ static float2 dot_product(const float2 * x, const float2 * y) {
+    /* The obvious way to write this dot product -- read it to see WHAT the body below
+       computes; the body computes the identical result, just faster:
+
+           float2 sum = make_float2(0.0f, 0.0f);
+           sum = df_add(sum, df_mul(x[1], y[1]));   // multiply a pair, add it to the total
+           sum = df_add(sum, df_mul(x[2], y[2]));
+           sum = df_add(sum, df_mul(x[3], y[3]));
+           return sum;                              // ~81 float ops over the 3 terms
+
+       df_mul and df_add each finish by renormalizing their (hi, lo) result -- cleaning it
+       into a tidy non-overlapping pair for the next op. Between terms that cleanup is wasted
+       work: the very next add disturbs the low word again. The body below skips it -- it keeps
+       the running total's high word in sum.x, lets every leftover bit pile up untidied in
+       sum.y, and renormalizes ONCE at the end (df_quick_two_sum). Same answer in ~39 float ops
+       instead of ~81, a bit under half the work. Per term: p is the exact product as
+       (high, error); lo folds in the two cross terms hi*lo + lo*hi that the pairs carry (one
+       FMA); s two-sums the high word into the running total, and its remainder plus lo drop
+       into sum.y. Hand-unrolled over the three components to match the rest of the file. */
     float2 sum = make_float2(0.0f, 0.0f);
-    sum = df_add(sum, df_mul(x[1], y[1]));
-    sum = df_add(sum, df_mul(x[2], y[2]));
-    sum = df_add(sum, df_mul(x[3], y[3]));
-    return sum;
+
+    float2 p1  = df_two_prod(x[1].x, y[1].x);
+    float  lo1 = __fmaf_rn(x[1].x, y[1].y, __fmaf_rn(x[1].y, y[1].x, p1.y));
+    float2 s1  = df_two_sum(sum.x, p1.x);
+    sum.x = s1.x;
+    sum.y += s1.y + lo1;
+
+    float2 p2  = df_two_prod(x[2].x, y[2].x);
+    float  lo2 = __fmaf_rn(x[2].x, y[2].y, __fmaf_rn(x[2].y, y[2].x, p2.y));
+    float2 s2  = df_two_sum(sum.x, p2.x);
+    sum.x = s2.x;
+    sum.y += s2.y + lo2;
+
+    float2 p3  = df_two_prod(x[3].x, y[3].x);
+    float  lo3 = __fmaf_rn(x[3].x, y[3].y, __fmaf_rn(x[3].y, y[3].x, p3.y));
+    float2 s3  = df_two_sum(sum.x, p3.x);
+    sum.x = s3.x;
+    sum.y += s3.y + lo3;
+
+    return df_quick_two_sum(sum.x, sum.y);
 }
 
 /* fractional: distance from the nearest Bragg peak, reduced to |delta| <= 0.5 */
@@ -1379,12 +1413,42 @@ __device__ __inline__ static float parallax(const float2 * __restrict__ odet, co
     return real_to_float(__ldg(&odet[1])) * diffracted_f[1] + real_to_float(__ldg(&odet[2])) * diffracted_f[2] + real_to_float(__ldg(&odet[3])) * diffracted_f[3];
 }
 
+/* compensated-pair form of the axis rotation: rotate the (hi, lo) vector v about the
+   (hi, lo) unit axis by angle phi, writing the (hi, lo) result into newv. The trig
+   constants sin(phi)/cos(phi) are single-precision scalars (one sin and one cos, as in
+   the float rotate_axis); every vector product and sum is carried as a compensated pair
+   so the rotated position keeps its low word instead of collapsing to float. Mirrors the
+   float rotate_axis term for term:
+       newv = v*cos + (axis x v)*sin + axis*(axis . v)*(1 - cos)
+   4-element convention, element 0 (magnitude) left untouched. */
+__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float phi) {
+    const float sinphi = sin(phi);
+    const float cosphi = cos(phi);
+    const float2 a1 = axis[1];
+    const float2 a2 = axis[2];
+    const float2 a3 = axis[3];
+    const float2 v1 = v[1];
+    const float2 v2 = v[2];
+    const float2 v3 = v[3];
+    float2 dot = df_add(df_add(df_mul(a1, v1), df_mul(a2, v2)), df_mul(a3, v3));
+    dot = df_mul_f(dot, 1.0f - cosphi);
+
+    newv[1] = df_add(df_add(df_mul(a1, dot), df_mul_f(v1, cosphi)),
+                     df_mul_f(df_sub(df_mul(a2, v3), df_mul(a3, v2)), sinphi));
+    newv[2] = df_add(df_add(df_mul(a2, dot), df_mul_f(v2, cosphi)),
+                     df_mul_f(df_sub(df_mul(a3, v1), df_mul(a1, v3)), sinphi));
+    newv[3] = df_add(df_add(df_mul(a3, dot), df_mul_f(v3, cosphi)),
+                     df_mul_f(df_sub(df_mul(a1, v2), df_mul(a2, v1)), sinphi));
+}
+
 /* curved-detector pixel rotation: construct a detector pixel that is always "distance"
    from the sample by rotating pixel_pos about sdet_vector then fdet_vector. The float
    form is the base kernel's exact rotation, operating directly on pixel_pos. The df64
-   form narrows pixel_pos/sdet_vector/fdet_vector to float, performs the same two
-   rotations in the same order, then widens the result back into pixel_pos (an exact
-   widening of a float-exact value). */
+   form carries the rotation in the compensated pair representation: the rotation angles
+   are the same single-precision pixel_pos[2]/distance and pixel_pos[3]/distance the float
+   form uses (and the sin/cos are single-precision scalars inside rotate_axis), but the
+   vector being rotated and the sdet/fdet basis stay (hi, lo) pairs, so the rotated pixel
+   position keeps its low word rather than collapsing to float across the rotation. */
 __device__ __inline__ static void curved_position(const float * sdet_vector, const float * fdet_vector, float distance,
         const float * dbvector, float * pixel_pos) {
     float newvector[4];
@@ -1393,20 +1457,21 @@ __device__ __inline__ static void curved_position(const float * sdet_vector, con
 }
 __device__ __inline__ static void curved_position(const float2 * sdet_vector, const float2 * fdet_vector, float distance,
         const float * dbvector, float2 * pixel_pos) {
-    float ppos_f[4] = { real_to_float(pixel_pos[0]), real_to_float(pixel_pos[1]), real_to_float(pixel_pos[2]), real_to_float(pixel_pos[3]) };
-    float sdet_f[4] = { real_to_float(sdet_vector[0]), real_to_float(sdet_vector[1]), real_to_float(sdet_vector[2]), real_to_float(sdet_vector[3]) };
-    float fdet_f[4] = { real_to_float(fdet_vector[0]), real_to_float(fdet_vector[1]), real_to_float(fdet_vector[2]), real_to_float(fdet_vector[3]) };
-    float newvector[4];
-    rotate_axis(dbvector, newvector, sdet_f, ppos_f[2] / distance);
-    rotate_axis(newvector, ppos_f, fdet_f, ppos_f[3] / distance);
-    /* this overload only ever runs when Real is float2, so the widen-back calls
-       make_real_double directly rather than through the NB_PRECISION-aliased name:
-       this function body is unconditionally compiled at both precisions (like every
-       float2 overload in this file), and the alias tracks the active compile pass,
-       not which overload is executing it. */
-    pixel_pos[1] = make_real_double(ppos_f[1]);
-    pixel_pos[2] = make_real_double(ppos_f[2]);
-    pixel_pos[3] = make_real_double(ppos_f[3]);
+    /* rotation angles from the high word of the compensated pixel position, matching the
+       float form's pixel_pos[2]/distance and pixel_pos[3]/distance exactly. */
+    const float phi_s = real_to_float(pixel_pos[2]) / distance;
+    const float phi_f = real_to_float(pixel_pos[3]) / distance;
+    /* dbvector is the single-precision sample->distance * beam_vector input; widen it to
+       compensated pairs so the whole rotation runs in the pair representation. sdet_vector
+       and fdet_vector are already Real (float2) here, so they enter the rotation as pairs
+       instead of being narrowed to float. */
+    float2 dbv[4];
+    dbv[1] = make_real_double(dbvector[1]);
+    dbv[2] = make_real_double(dbvector[2]);
+    dbv[3] = make_real_double(dbvector[3]);
+    float2 newvector[4];
+    rotate_axis(dbv, newvector, sdet_vector, phi_s);
+    rotate_axis(newvector, pixel_pos, fdet_vector, phi_f);
 }
 
 /* make a unit vector pointing in same direction and report magnitude (both args can

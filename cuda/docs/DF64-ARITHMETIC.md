@@ -230,7 +230,64 @@ block. (df_sub is df_add with y's signs flipped.) Square root (`df_sqrt`) is the
 seeded from the hardware `rsqrtf`. Both operations are in the papers: Dekker's original gives
 division, and Thall's write-up works out df64 division and square root in full.
 
-## 4. What the pair buys — and what it does not
+## 4. The dot product — deferring the renormalization
+
+A dot product is a sum of products. For the Miller index it is `x[1]·y[1] + x[2]·y[2] + x[3]·y[3]`, where every number is a (hi, lo) pair. The obvious way to compute it reuses the tools from section 3 — multiply each pair of pairs with `df_mul`, add each product into a running total with `df_add`:
+
+    float2 sum = {0, 0};
+    sum = df_add(sum, df_mul(x[1], y[1]));
+    sum = df_add(sum, df_mul(x[2], y[2]));
+    sum = df_add(sum, df_mul(x[3], y[3]));
+    return sum;
+
+That is the readable statement of what the dot means, and for three terms it is perfectly correct. It is also doing more work than it needs to. Every `df_mul` and every `df_add` ends by *renormalizing* — a final `df_quick_two_sum` that repackages its (hi, lo) result into a clean, non-overlapping pair for the next operation to consume. That cleanup earns its keep when you are handing a value to someone else. In the middle of a sum it is wasted: the tidy pair goes straight into the next `df_add`, which disturbs the low word all over again. You pay to clean up after every term and then immediately un-clean it.
+
+The faster arrangement stops cleaning up between terms. Carry two running quantities: one high word holding the sum so far, and one plain float where every leftover correction piles up. For each term, take the product's rounding error and the addition's leftover and drop both onto that pile — no repackaging. Renormalize exactly once, after the last term. This is the **Dot2** algorithm of Ogita, Rump, and Oishi.
+
+> T. Ogita, S. M. Rump, S. Oishi, *Accurate Sum and Dot Product* (2005)
+> https://www.tuhh.de/ti3/paper/rump/OgRuOi05.pdf
+
+Same answer, roughly **39 float operations instead of 81** for the three-term dot — a bit under half the work — because the per-term repackaging is gone.
+
+**The one wrinkle for our pairs.** Plain Dot2 assumes each input is a single number, so each product has exactly one rounding error to carry. Here each input is a (hi, lo) pair, so the exact product of two pairs has more pieces:
+
+    a·b = a_hi·b_hi + (a_hi·b_lo + a_lo·b_hi) + a_lo·b_lo
+
+The leading `a_hi·b_hi` is the ordinary product. The two middle **cross terms** are the extra baggage the pair representation carries; we fold them onto the correction pile with a fused multiply-add, next to the rounding error already sitting there. The last term, `a_lo·b_lo`, is too small to matter — below the pair's ~14-digit resolution — and is dropped, the same drop `df_mul` already makes. That fold is the only change needed to fit the published single-number algorithm to our pairs, and every operation stays on the float pipe.
+
+### One term at a time
+
+The running total starts at (0, 0). Every term then runs the same short routine. Writing the
+running total as the pair (sum_hi, sum_lo) and the term being added as a·b — where a and b are
+each pairs, a = a_hi + a_lo and b = b_hi + b_lo:
+
+    p       = df_two_prod(a_hi, b_hi)                    // exact product of the high words
+    e       = fmaf(a_hi, b_lo, fmaf(a_lo, b_hi, p_lo))   // add the two cross terms onto its error
+    s       = df_two_sum(sum_hi, p_hi)                   // add into the running high word
+    sum_hi  = s_hi                                       // advance the high word
+    sum_lo += s_lo + e                                   // pool both leftovers, unrenormalized
+
+1. **Multiply the high words exactly.** `df_two_prod` returns the product of the two high words
+   as a pair: `p_hi` is the rounded product, `p_lo` the bit rounding threw away.
+2. **Fold in the cross terms.** Because a and b are pairs, the true product also carries
+   `a_hi·b_lo + a_lo·b_hi`; two fused multiply-adds add those onto `p_lo`, giving one per-term
+   correction `e` that holds everything the high-word product left out.
+3. **Add into the running total.** `df_two_sum` adds `p_hi` to the running high word and hands
+   back the rounded sum `s_hi` plus the exact remainder `s_lo` — the part of that addition that
+   did not fit.
+4. **Advance the high word.** `s_hi` becomes the new running high word.
+5. **Pool the leftovers.** Both corrections — the addition's remainder `s_lo` and the term's
+   correction `e` — are added onto the running low word. Nothing is repackaged into a clean
+   pair; the low word just holds a growing pile of corrections.
+
+Steps 4 and 5 are the whole point: the high word walks forward while the corrections wait
+together in the low word, so no term pays for a renormalization. After the last term, one final
+`df_quick_two_sum` folds the low word back into the high word and returns a clean pair — the
+single cleanup the whole arrangement was built to reach.
+
+**Why deferring is safe.** It is fair to worry that skipping the per-term cleanup loses accuracy. It does not, for one reason: the two-sum is exact for numbers of *any* sign. When two terms are large, opposite, and nearly cancel — the case that wrecks a naive float sum — the two-sum's leftover captures exactly the digits the cancellation would otherwise destroy, and they land safely on the correction pile. Deferring keeps every one of those corrections; it simply adds them all in at the end instead of after each term. That is the line between deferring the renormalization (safe) and a "sloppy" add that skips the correction entirely (not safe — that one throws digits away).
+
+## 5. What the pair buys — and what it does not
 
 Each df64 operation is accurate to about 14 decimal digits. Compared to a real float64:
 
@@ -245,7 +302,7 @@ Each df64 operation is accurate to about 14 decimal digits. Compared to a real f
   where float64 runs at 1/32–1/64 of the float32 rate, paying ~10–20 float32 ops for
   double-quality arithmetic wins decisively.
 
-## 5. What breaks it
+## 6. What breaks it
 
 The EFTs are exact only under strict round-to-nearest IEEE-754 rules:
 
