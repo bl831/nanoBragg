@@ -1236,15 +1236,49 @@ __device__ __inline__ static float dot_product(const float * x, const float * y)
     return x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
 }
 
-/* compensated projection of a scattering vector onto a cell vector to form one
-   Miller index: accumulate the three (hi, lo) products into a running (hi, lo) sum,
-   keeping the full width of every partial. 4-element convention, element 0 unused. */
+/* Compensated dot product of two 3-vectors whose components are (hi, lo) float
+   pairs -- forms one Miller index (x . y) to near-double accuracy using only
+   float arithmetic. 4-element convention, element 0 unused. */
 __device__ __inline__ static float2 dot_product(const float2 * x, const float2 * y) {
+    /* The obvious way to write this dot product -- read it to see WHAT the body below
+       computes; the body computes the identical result, just faster:
+
+           float2 sum = make_float2(0.0f, 0.0f);
+           sum = df_add(sum, df_mul(x[1], y[1]));   // multiply a pair, add it to the total
+           sum = df_add(sum, df_mul(x[2], y[2]));
+           sum = df_add(sum, df_mul(x[3], y[3]));
+           return sum;                              // ~81 float ops over the 3 terms
+
+       df_mul and df_add each finish by renormalizing their (hi, lo) result -- cleaning it
+       into a tidy non-overlapping pair for the next op. Between terms that cleanup is wasted
+       work: the very next add disturbs the low word again. The body below skips it -- it keeps
+       the running total's high word in sum.x, lets every leftover bit pile up untidied in
+       sum.y, and renormalizes ONCE at the end (df_quick_two_sum). Same answer in ~39 float ops
+       instead of ~81, a bit under half the work. Per term: p is the exact product as
+       (high, error); lo folds in the two cross terms hi*lo + lo*hi that the pairs carry (one
+       FMA); s two-sums the high word into the running total, and its remainder plus lo drop
+       into sum.y. Hand-unrolled over the three components to match the rest of the file. */
     float2 sum = make_float2(0.0f, 0.0f);
-    sum = df_add(sum, df_mul(x[1], y[1]));
-    sum = df_add(sum, df_mul(x[2], y[2]));
-    sum = df_add(sum, df_mul(x[3], y[3]));
-    return sum;
+
+    float2 p1  = df_two_prod(x[1].x, y[1].x);
+    float  lo1 = __fmaf_rn(x[1].x, y[1].y, __fmaf_rn(x[1].y, y[1].x, p1.y));
+    float2 s1  = df_two_sum(sum.x, p1.x);
+    sum.x = s1.x;
+    sum.y += s1.y + lo1;
+
+    float2 p2  = df_two_prod(x[2].x, y[2].x);
+    float  lo2 = __fmaf_rn(x[2].x, y[2].y, __fmaf_rn(x[2].y, y[2].x, p2.y));
+    float2 s2  = df_two_sum(sum.x, p2.x);
+    sum.x = s2.x;
+    sum.y += s2.y + lo2;
+
+    float2 p3  = df_two_prod(x[3].x, y[3].x);
+    float  lo3 = __fmaf_rn(x[3].x, y[3].y, __fmaf_rn(x[3].y, y[3].x, p3.y));
+    float2 s3  = df_two_sum(sum.x, p3.x);
+    sum.x = s3.x;
+    sum.y += s3.y + lo3;
+
+    return df_quick_two_sum(sum.x, sum.y);
 }
 
 /* fractional: distance from the nearest Bragg peak, reduced to |delta| <= 0.5 */
