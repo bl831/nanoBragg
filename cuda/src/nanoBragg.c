@@ -214,6 +214,8 @@ int main(int argc, char** argv)
     double airpath,omega_pixel,omega_Rsqr_pixel,omega_sum;
     int curved_detector = 0;
     int point_pixel= 0;
+    /* device arithmetic precision: 0 = single (default), 1 = df64 (see -precision) */
+    int precision_double = 0;
     /* beam center value that goes into the image header */
     double Xbeam=NAN,Ybeam=NAN;
     /* direct beam coordinate on fast/slow pixel axes; used for diffraction if pivot=beam */
@@ -918,6 +920,16 @@ int main(int argc, char** argv)
             {
                 hklfilename = argv[i+1];
             }
+            if(strstr(argv[i], "-precision") && (argc > (i+1)))
+            {
+                if(0==strcmp(argv[i+1], "single")) precision_double = 0;
+                else if(0==strcmp(argv[i+1], "double")) precision_double = 1;
+                else
+                {
+                    printf("ERROR: -precision must be single or double (got \"%s\").\n", argv[i+1]);
+                    exit(9);
+                }
+            }
             if(strstr(argv[i], "-default_F") && (argc > (i+1)))
             {
                 default_F = atof(argv[i+1]);
@@ -1280,6 +1292,7 @@ int main(int argc, char** argv)
         printf("\t-nopolar         \tturn off the polarization correction\n");
         printf("\t-nointerpolate   \tdisable inter-Bragg peak structure factor interpolation\n");
         printf("\t-interpolate     \tforce inter-Bragg peak structure factor interpolation (default: on if < 3 cells wide) (not supported on GPU)\n");
+        printf("\t-precision       \tGPU compute precision: single or double. double approximates the CPU reference but takes longer (default: single)\n");
         printf("\t-point_pixel     \tturn off the pixel solid angle correction\n");
         printf("\t-curved_det      \tall pixels same distance from crystal\n");
         printf("\t-fdet_vector     \tunit vector of increasing fast-axis detector pixel coordinate (default: %g %g %g)\n",fdet_vector[1],fdet_vector[2],fdet_vector[3]);
@@ -2507,7 +2520,17 @@ int main(int argc, char** argv)
     progress_pixel = 0;
     omega_sum = 0.0;
 
-	nanoBraggSpotsCUDA(spixels, fpixels, roi_xmin, roi_xmax, roi_ymin, roi_ymax, oversample, point_pixel, pixel_size, subpixel_size, steps, detector_thickstep,
+	printf("precision: %s\n", precision_double ? "double" : "single");
+
+	if(precision_double)
+	nanoBraggSpotsCUDA_double(spixels, fpixels, roi_xmin, roi_xmax, roi_ymin, roi_ymax, oversample, point_pixel, pixel_size, subpixel_size, steps, detector_thickstep,
+		detector_thicksteps, detector_thick, detector_mu, sdet_vector, fdet_vector, odet_vector, pix0_vector, curved_detector, distance, close_distance, beam_vector,
+		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
+		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,
+		interpolate, Fhkl, h_min, h_max, h_range, k_min, k_max, k_range, l_min, l_max, l_range, hkls, nopolar, polar_vector, polarization, fudge, maskimage,
+		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/);
+	else
+	nanoBraggSpotsCUDA_single(spixels, fpixels, roi_xmin, roi_xmax, roi_ymin, roi_ymax, oversample, point_pixel, pixel_size, subpixel_size, steps, detector_thickstep,
 		detector_thicksteps, detector_thick, detector_mu, sdet_vector, fdet_vector, odet_vector, pix0_vector, curved_detector, distance, close_distance, beam_vector,
 		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
 		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,

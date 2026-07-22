@@ -16,7 +16,7 @@ Before building nanoBragg, ensure the following prerequisites are installed:
 - Required for GPU acceleration.
 - Download and installation instructions: [CUDA Downloads](https://developer.nvidia.com/cuda-downloads), or [CUDA Toolkit Archive](https://developer.nvidia.com/cuda-toolkit-archive) for older versions. 
 - Minimum version: CUDA 12.9.
-- Ensure you have an NVIDIA GPU with CUDA support (Compute Capability 5.0 or higher)
+- Ensure you have an NVIDIA GPU with CUDA support (Compute Capability 6.1 or higher)
 
 ### GCC/G++ Compiler
 - Required for compiling C/C++ and CUDA code.
@@ -51,7 +51,7 @@ Test the optimized release version: `sh ./test/test_release.sh`
 ### Additional Hardware
 nanoBraggCUDA can be built for different NVIDIA hardware, though most configurations have not been tested. Use the Hardware Compatibility Matrix below to identify the Compute Capability for the graphics card, then find a CUDA SDK version that supports it. Next determine if the CUDA SDK version is supported on the target Operating System by following the instructions above for installing the NVIDIA CUDA Toolkit. Update the CUDA_PATH and the ARCH_FLAGS in the Makefile accordingly.
 
-The original CUDA kernel for nanoBraggCUDA was developed on and optimized for Kepler (Compute Capability 3.5) and Pascal (Compute Capability 6.1). Though the kernel should run on other hardware, it is not optimized for it. Ideally, a dedicated kernel should be written for each targeted Compute Capability.
+Previous versions of the CUDA kernel were written for Kepler (Compute Capability 3.5) and Pascal (Compute Capability 6.1). The repository has since been updated to target modern architectures and operating systems: the minimum supported hardware is now Compute Capability 6.1 and the minimum CUDA toolkit is 12.9. Though the kernel should run on any supported hardware, it is not tuned for every architecture. Ideally, a dedicated kernel should be written for each targeted Compute Capability.
 
 ### NVIDIA Hardware Compatibility Matrix
 https://en.wikipedia.org/wiki/CUDA#GPUs_supported

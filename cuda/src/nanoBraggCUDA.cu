@@ -1,17 +1,27 @@
 /*
- * nanoBraggCUDA.cu -- production single-precision (float) CUDA kernel computing
- * nanoBragg diffraction images. All device arithmetic is float.
+ * nanoBraggCUDA.cu -- CUDA kernel computing nanoBragg diffraction
+ * images. The precision-sensitive chain -- the detector position, the diffracted and
+ * scattering vectors, the Miller-index projection, the water background and the photon
+ * scale -- is written against a precision-selectable working type Real; the correction
+ * factors (airpath, solid angle, parallax, polarization) stay float. The same source
+ * compiles at two precisions -- single and df64 -- each renaming its public entry
+ * point so both objects link into one binary (see the NB_PRECISION selector below).
  *
- * Entry point: extern "C" nanoBraggSpotsCUDA(...), which marshals the host
- * (double) parameters to the device, launches nanoBraggSpotsCUDAKernel,
- * and reduces the result image.
+ * Entry point: extern "C" nanoBraggSpotsCUDA(...), renamed per precision to
+ * nanoBraggSpotsCUDA_single / nanoBraggSpotsCUDA_double, which marshals the host
+ * (double) parameters to the device, launches nanoBraggSpotsCUDAKernel, and
+ * reduces the result image.
  *
- * Two structural facts a reader needs:
+ * Three structural facts a reader needs:
  *   - The per-(phi, mosaic) rotated unit-cell vectors are precomputed on the
  *     host (in double, matching the nanoBraggCPU.c reference) and read from the
  *     phi_mos_* tables in the hot loop, so the kernel does no in-loop rotation.
  *   - The lattice shape transform uses a delta-reduced sincg: the fractional
  *     Miller index is reduced to |delta| <= 0.5 before the trig call.
+ *   - Working-precision (float2) values are block-scoped: each is built and consumed
+ *     inside its loop body, and only plain float/short representatives escape. At
+ *     df64 the compensated pairs carry near-double accuracy on the single-precision
+ *     pipe without the scarce double-precision units.
  */
 
 /* Configuration and types */
@@ -24,6 +34,38 @@
 #include <driver_types.h>
 #include "nanotypes.h"
 #include "nanoBraggCUDA.h"
+
+/* Precision selector. Real is the working type of the precision-sensitive chain: the
+   detector position, the diffracted and scattering vectors, the Miller indices and the
+   rotated cell vectors that feed them, the water background and the photon scale. At
+   single precision Real is float and the chain is ordinary single-precision arithmetic;
+   at df64 Real is a float2 carrying a value as an unevaluated (hi, lo) pair, so
+   compensated arithmetic reaches near-double accuracy on the single-precision pipe
+   without the scarce double-precision units. Overload resolution on Real selects every
+   precision-sensitive operation whose parameters carry the working type. make_real and
+   real_product take the same float (or float, float) input at both precisions and only
+   their result differs, so overload resolution cannot pick between them; this selector
+   aliases each to its precision-specific name instead, and both names are always defined
+   below regardless of which one a given compile actually calls. Each compile also renames
+   the public entry point so both precisions can link into one binary. */
+#define NB_PREC_SINGLE 1
+#define NB_PREC_DF64   2
+#ifndef NB_PRECISION
+#define NB_PRECISION NB_PREC_SINGLE
+#endif
+#if   NB_PRECISION == NB_PREC_SINGLE
+typedef float  Real;
+#define nanoBraggSpotsCUDA nanoBraggSpotsCUDA_single
+#define make_real          make_real_float
+#define real_product       real_product_float
+#elif NB_PRECISION == NB_PREC_DF64
+typedef float2 Real;
+#define nanoBraggSpotsCUDA nanoBraggSpotsCUDA_double
+#define make_real          make_real_double
+#define real_product       real_product_double
+#else
+#error "NB_PRECISION must be NB_PREC_SINGLE or NB_PREC_DF64"
+#endif
 
 static void CheckCudaErrorAux(const char *, unsigned, const char *, cudaError_t);
 #define CUDA_CHECK_RETURN(value) CheckCudaErrorAux(__FILE__,__LINE__, #value, value)
@@ -46,19 +88,22 @@ struct structureFactorParams {
 };
 
 struct constParams {
-    float Avogadro;
-    float r_e_sqr;
+    Real Avogadro;
+    Real r_e_sqr;
+    /* r_e_sqr * fluence, folded once on the host in double ahead of the per-precision
+       split (see water_bg / photon_scale for how each precision uses it). */
+    Real r_e_sqr_fluence;
 };
 
 struct beamSource {
-    float neg_unit_source_vector[VECTOR_SIZE];
+    Real neg_unit_source_vector[VECTOR_SIZE];
     float intensity;
-    float lambda;
+    Real lambda;
 };
 
 struct beamParams {
     float beam_vector[VECTOR_SIZE];
-    float fluence;
+    Real fluence;
     bool calc_polar;
     float polarization;
     float polar_vector[VECTOR_SIZE];
@@ -75,31 +120,31 @@ struct detectorParams {
     short oversample;
     bool point_pixel;
     float pixel_size;
-    float subpixel_size;
+    Real subpixel_size;
     long steps;
     float detector_thickstep;
     short detector_thicksteps;
     float detector_thick;
     float detector_mu;
     bool curved_detector;
-    float sdet_vector[VECTOR_SIZE];
-    float fdet_vector[VECTOR_SIZE];
-    float odet_vector[VECTOR_SIZE];
-    float pix0_vector[VECTOR_SIZE];
+    Real sdet_vector[VECTOR_SIZE];
+    Real fdet_vector[VECTOR_SIZE];
+    Real odet_vector[VECTOR_SIZE];
+    Real pix0_vector[VECTOR_SIZE];
 };
 
 struct sampleParams {
     float distance;
     float close_distance;
     float water_size;
-    float water_F;
-    float water_MW;
+    Real water_F;
+    Real water_MW;
 };
 
 struct unitCell {
-    float a0[VECTOR_SIZE];
-    float b0[VECTOR_SIZE];
-    float c0[VECTOR_SIZE];
+    Real a0[VECTOR_SIZE];
+    Real b0[VECTOR_SIZE];
+    Real c0[VECTOR_SIZE];
     float V_cell;
 };
 
@@ -124,34 +169,23 @@ struct goniometerParams {
 
 /* Forward declarations */
 
-__global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ detectorPtr, const beamParams * __restrict__ beamPtr, const goniometerParams * __restrict__ goniometerPtr, const sampleParams * __restrict__ samplePtr,
+static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ detectorPtr, const beamParams * __restrict__ beamPtr, const goniometerParams * __restrict__ goniometerPtr, const sampleParams * __restrict__ samplePtr,
         const crystalParams * crystalPtr, const constParams * __restrict__ constantsPtr, const beamSource * __restrict__ beam_sources, const float * __restrict__ Fhkl,
-        const float * __restrict__ phi_mos_a, const float * __restrict__ phi_mos_b, const float * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
+        const Real * __restrict__ phi_mos_a, const Real * __restrict__ phi_mos_b, const Real * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap);
 
-/* vector inner product where vector magnitude is 0th element */
-__device__ __inline__ static float dot_product(const float * x, const float * y);
 /* vector cross product where vector magnitude is 0th element */
 __device__ static float *cross_product(const float * x, const float * y, float * z);
 __device__ __inline__ float norm3d_fma_rn(float v1, float v2, float v3);
-/* make a unit vector pointing in same direction and report magnitude (both args can be same vector) */
-__device__ static float unitize(float * vector,
-float *new_unit_vector);
 /* rotate a 3-vector about a unit vector axis */
-__device__ static float *rotate_axis(const float * __restrict__ v,
-float *newv, const float * __restrict__ axis, const float phi);
+__device__ static float *rotate_axis(const float * __restrict__ v, float *newv, const float * __restrict__ axis, const float phi);
 __device__ __inline__ static long flatten3dindex(short x, short y, short z, short x_range, short y_range, short z_range);
 __device__ __inline__ float quickFcell_ldg(short hkls, short h0, short h_max, short h_min, short k0, short k_max, short k_min, short l0, short l_max,
         short l_min, short h_range,
         short k_range, short l_range, const float * __restrict__ Fhkl);
 /* load the fully phi+mosaic-rotated cell (a/b/c[4], element[0]=0) from the host
    phi_mos_* table via __ldg; arguments are (table, out, index). */
-__device__ __forceinline__ void load_rotated_cell_ldg(const float * __restrict__ tbl, float out[4], int idx_base);
-/* nearest_hkl: integer Miller index of the nearest reciprocal-lattice point
-   (the Fhkl structure-factor lookup index) */
-__device__ __forceinline__ static short nearest_hkl(float h);
-/* fractional: distance from the nearest Bragg peak, reduced to |delta| <= 0.5 */
-__device__ __forceinline__ static float fractional(float h);
+__device__ __forceinline__ void load_rotated_cell_ldg(const Real * __restrict__ tbl, Real out[4], int idx_base);
 /* delta-reduced sincg: N-slit interference function evaluated from the already-reduced
    delta = h - rint(h); pi is applied inside */
 __device__ __inline__ static float sincg_delta(float delta, float N);
@@ -160,6 +194,83 @@ __device__ static float sinc3(float x);
 /* polarization factor from vectors */
 __device__ static float polarization_factor(float kahn_factor, const float * __restrict__ unitIncident, float *unitDiffracted,
         const float * __restrict__ unitAxis);
+
+/* compensated (hi, lo) primitives: error-free transforms (df_two_sum/df_two_prod/
+   df_quick_two_sum) and the double-float add/sub/mul/sqrt/div composed from them. They
+   back the df64 overloads of the geometry and scale operations below. */
+__device__ __inline__ static float2 df_two_sum(float a, float b);
+__device__ __inline__ static float2 df_two_prod(float a, float b);
+__device__ __inline__ static float2 df_quick_two_sum(float a, float b);
+__device__ __inline__ static float2 df_add(float2 a, float2 b);
+__device__ __inline__ static float2 df_add_f(float2 a, float b);
+__device__ __inline__ static float2 df_mul(float2 a, float2 b);
+__device__ __inline__ static float2 df_mul_f(float2 a, float b);
+__device__ __inline__ static float2 df_sub(float2 a, float2 b);
+__device__ __inline__ static float2 df_sqrt(float2 a);
+__device__ __inline__ static float2 df_div(float2 a, float2 b);
+
+/* Precision-selectable geometry and scale operations, one float form (base kernel
+   expressions) and one float2 form (compensated df64 expressions) each, adjacent in
+   pairs. Overload resolution on the working type keeps the kernel body free of
+   precision branches, except for make_real and real_product (see the selector above). */
+/* vector inner product where vector magnitude is 0th element */
+__device__ __inline__ static float dot_product(const float * x, const float * y);
+__device__ __inline__ static float2 dot_product(const float2 * x, const float2 * y);
+/* fractional: distance from the nearest Bragg peak, reduced to |delta| <= 0.5 */
+__device__ __forceinline__ static float fractional(float h);
+__device__ __forceinline__ static float fractional(float2 h);
+/* nearest_hkl: integer Miller index of the nearest reciprocal-lattice point
+   (the Fhkl structure-factor lookup index) */
+__device__ __forceinline__ static short nearest_hkl(float h);
+__device__ __forceinline__ static short nearest_hkl(float2 h);
+/* widen a single-precision value into the working precision: identity for float,
+   zero low word for the compensated pair */
+__device__ __forceinline__ static float make_real_float(float v);
+__device__ __forceinline__ static float2 make_real_double(float v);
+/* the single-precision representative of a working-precision value: identity for
+   float, high word of the compensated pair */
+__device__ __forceinline__ static float real_to_float(float v);
+__device__ __forceinline__ static float real_to_float(float2 v);
+/* product of two single-precision values into the working precision (exact df pair) */
+__device__ __inline__ static float real_product_float(float a, float b);
+__device__ __inline__ static float2 real_product_double(float a, float b);
+/* sub-pixel detector coordinate: subpix * count + subpix/2 */
+__device__ __inline__ static float subpixel_coord(float subpix, float count);
+__device__ __inline__ static float2 subpixel_coord(float2 subpix, float count);
+/* one detector-basis position component: Fdet*fv + Sdet*sv + Odet*ov + pv */
+__device__ __inline__ static float detector_position(float Fdet, float Sdet, float Odet, float fv, float sv, float ov, float pv);
+__device__ __inline__ static float2 detector_position(float2 Fdet, float2 Sdet, float2 Odet, float2 fv, float2 sv, float2 ov, float2 pv);
+/* working-precision diffracted ray: the single form reuses the already-computed float
+   unit vector; the df64 form normalizes the df pixel position (df sqrt + df divide) */
+__device__ __inline__ static void diffracted_ray(const float * diffracted_f, const float * pixel_pos, float * diffracted);
+__device__ __inline__ static void diffracted_ray(const float * diffracted_f, const float2 * pixel_pos, float2 * diffracted);
+/* working-precision scattering vector sc = (diffracted - source)/lambda; the third
+   overload is the float pre-filter at the dmin site, narrowing the Real source and
+   lambda to feed the cheap resolution cutoff before the working-precision vector below */
+__device__ __inline__ static void scattering_vector(const float * diffracted, const float * neg_source, float lambda, float * sc);
+__device__ __inline__ static void scattering_vector(const float2 * diffracted, const float2 * neg_source, float2 lambda, float2 * sc);
+__device__ __inline__ static void scattering_vector(const float * diffracted_f, const float2 * neg_src, float2 lambda, float * scattering);
+/* inverse of effective detector-thickness increase: dot product of odet_vector and
+   the float representative of the diffracted ray */
+__device__ __inline__ static float parallax(const float * __restrict__ odet, const float * diffracted_f);
+__device__ __inline__ static float parallax(const float2 * __restrict__ odet, const float * diffracted_f);
+/* curved-detector pixel rotation: rotate pixel_pos about sdet_vector then fdet_vector
+   so it is always "distance" from the sample */
+__device__ __inline__ static void curved_position(const float * sdet_vector, const float * fdet_vector, float distance,
+        const float * dbvector, float * pixel_pos);
+__device__ __inline__ static void curved_position(const float2 * sdet_vector, const float2 * fdet_vector, float distance,
+        const float * dbvector, float2 * pixel_pos);
+/* make a unit vector pointing in same direction and report magnitude (both args can be same vector) */
+__device__ static float unitize(float * vector, float *new_unit_vector);
+__device__ static float unitize(float2 * vector, float *new_unit_vector);
+/* amorphous water background intensity per sub-pixel (single precision result) */
+__device__ __inline__ static float water_bg(float water_F, float r_e_sqr, float fluence, float r_e_sqr_fluence,
+        float water_size, float Avogadro, float water_MW);
+__device__ __inline__ static float water_bg(float2 water_F, float2 r_e_sqr, float2 fluence, float2 r_e_sqr_fluence,
+        float water_size, float2 Avogadro, float2 water_MW);
+/* photons-per-pixel scale: r_e_sqr * fluence * polar * I / steps (single precision result) */
+__device__ __inline__ static float photon_scale(float r_e_sqr, float fluence, float r_e_sqr_fluence, float polar, float I, long steps);
+__device__ __inline__ static float photon_scale(float2 r_e_sqr, float2 fluence, float2 r_e_sqr_fluence, float polar, float I, long steps);
 
 /* Host code */
 
@@ -176,6 +287,37 @@ static void doubleVectorToFloatVector(float * dest, double * src, size_t vector_
     for (size_t i = 0; i < vector_items; i++) {
         dest[i] = src[i];
     }
+}
+
+/* narrow a double to a plain float: the correctly rounded conversion */
+static inline float make_real_float(double v) {
+    return (float) v;
+}
+/* split a double into a compensated (hi, lo) float pair: hi is the correctly
+   rounded float, lo is the residual v - (double)hi the float drops, itself kept as a
+   float. Reconstructing hi + lo recovers the double to near-full precision on a
+   device that carries only float. */
+static inline float2 make_real_double(double v) {
+    float hi = (float) v;
+    float lo = (float) (v - (double) hi);
+    return make_float2(hi, lo);
+}
+
+/* Store a double vector into a working-precision vector, component by component,
+   through make_real (the Real analogue of doubleVectorToFloatVector). */
+static inline void make_real_vector(Real * dest, const double * src, size_t vector_items) {
+    for (size_t i = 0; i < vector_items; i++) {
+        dest[i] = make_real(src[i]);
+    }
+}
+
+/* Reconstruct a double from a stored working-precision value for host-side diagnostics:
+   the plain float cast at single precision, hi + lo at df64. */
+static inline double real_to_double(float v) {
+    return (double) v;
+}
+static inline double real_to_double(float2 v) {
+    return (double) v.x + (double) v.y;
 }
 
 /* make a unit vector pointing in same direction and report magnitude (both args can be same vector) */
@@ -234,17 +376,17 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     detector.oversample = oversample;
     detector.point_pixel = point_pixel;
     detector.pixel_size = pixel_size;
-    detector.subpixel_size = (float) subpixel_size;
+    detector.subpixel_size = make_real(subpixel_size);
     detector.steps = steps;
     detector.detector_thickstep = detector_thickstep;
     detector.detector_thicksteps = detector_thicksteps;
     detector.detector_thick = detector_thick;
     detector.detector_mu = detector_mu;
     detector.curved_detector = curved_detector;
-    doubleVectorToFloatVector(detector.sdet_vector, sdet_vector, VECTOR_SIZE);
-    doubleVectorToFloatVector(detector.fdet_vector, fdet_vector, VECTOR_SIZE);
-    doubleVectorToFloatVector(detector.odet_vector, odet_vector, VECTOR_SIZE);
-    doubleVectorToFloatVector(detector.pix0_vector, pix0_vector, VECTOR_SIZE);
+    make_real_vector(detector.sdet_vector, sdet_vector, VECTOR_SIZE);
+    make_real_vector(detector.fdet_vector, fdet_vector, VECTOR_SIZE);
+    make_real_vector(detector.odet_vector, odet_vector, VECTOR_SIZE);
+    make_real_vector(detector.pix0_vector, pix0_vector, VECTOR_SIZE);
 
     if (getenv("NB_DUMP_PIX0")) {
         fprintf(stderr, "NB_DUMP_PIX0 subpixel_size=%.17g pix0_vector=[%.17g, %.17g, %.17g, %.17g]\n",
@@ -256,19 +398,19 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
                 fdet_vector[0], fdet_vector[1], fdet_vector[2], fdet_vector[3]);
         fprintf(stderr, "NB_DUMP_PIX0 odet_vector(host double)=[%.17g, %.17g, %.17g, %.17g]\n",
                 odet_vector[0], odet_vector[1], odet_vector[2], odet_vector[3]);
-        fprintf(stderr, "NB_DUMP_PIX0 detector.sdet_vector(device float)=[%.17g, %.17g, %.17g, %.17g]\n",
-                (double) detector.sdet_vector[0], (double) detector.sdet_vector[1], (double) detector.sdet_vector[2], (double) detector.sdet_vector[3]);
-        fprintf(stderr, "NB_DUMP_PIX0 detector.fdet_vector(device float)=[%.17g, %.17g, %.17g, %.17g]\n",
-                (double) detector.fdet_vector[0], (double) detector.fdet_vector[1], (double) detector.fdet_vector[2], (double) detector.fdet_vector[3]);
-        fprintf(stderr, "NB_DUMP_PIX0 detector.odet_vector(device float)=[%.17g, %.17g, %.17g, %.17g]\n",
-                (double) detector.odet_vector[0], (double) detector.odet_vector[1], (double) detector.odet_vector[2], (double) detector.odet_vector[3]);
-        fprintf(stderr, "NB_DUMP_PIX0 detector.pix0_vector(device float)=[%.17g, %.17g, %.17g, %.17g]\n",
-                (double) detector.pix0_vector[0], (double) detector.pix0_vector[1], (double) detector.pix0_vector[2], (double) detector.pix0_vector[3]);
+        fprintf(stderr, "NB_DUMP_PIX0 detector.sdet_vector(device real)=[%.17g, %.17g, %.17g, %.17g]\n",
+                real_to_double(detector.sdet_vector[0]), real_to_double(detector.sdet_vector[1]), real_to_double(detector.sdet_vector[2]), real_to_double(detector.sdet_vector[3]));
+        fprintf(stderr, "NB_DUMP_PIX0 detector.fdet_vector(device real)=[%.17g, %.17g, %.17g, %.17g]\n",
+                real_to_double(detector.fdet_vector[0]), real_to_double(detector.fdet_vector[1]), real_to_double(detector.fdet_vector[2]), real_to_double(detector.fdet_vector[3]));
+        fprintf(stderr, "NB_DUMP_PIX0 detector.odet_vector(device real)=[%.17g, %.17g, %.17g, %.17g]\n",
+                real_to_double(detector.odet_vector[0]), real_to_double(detector.odet_vector[1]), real_to_double(detector.odet_vector[2]), real_to_double(detector.odet_vector[3]));
+        fprintf(stderr, "NB_DUMP_PIX0 detector.pix0_vector(device real)=[%.17g, %.17g, %.17g, %.17g]\n",
+                real_to_double(detector.pix0_vector[0]), real_to_double(detector.pix0_vector[1]), real_to_double(detector.pix0_vector[2]), real_to_double(detector.pix0_vector[3]));
     }
 
     beamParams beam;
     doubleVectorToFloatVector(beam.beam_vector, beam_vector, VECTOR_SIZE);
-    beam.fluence = fluence;
+    beam.fluence = make_real(fluence);
     beam.calc_polar = !nopolar;
     beam.polarization = polarization;
     /* Unitize the polar vector once here on the host instead of once per pixel on the GPU. */
@@ -297,9 +439,9 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     int nphi = phisteps > 0 ? phisteps : 1;
     int nmos = mosaic_domains > 0 ? mosaic_domains : 1;
     int pm_count = 3 * nphi * nmos;
-    float * phi_mos_a_host = new float[pm_count];
-    float * phi_mos_b_host = new float[pm_count];
-    float * phi_mos_c_host = new float[pm_count];
+    Real * phi_mos_a_host = new Real[pm_count];
+    Real * phi_mos_b_host = new Real[pm_count];
+    Real * phi_mos_c_host = new Real[pm_count];
     bool do_umat = (mosaic_spread > 0.0);
     for (int pt = 0; pt < nphi; pt++) {
         double phi_i = phistep * (double) pt + phi0;
@@ -315,7 +457,7 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
             rot[_c][2] = spindle_vector[2] * dot + v[2] * cosphi + (+spindle_vector[3] * v[1] - spindle_vector[1] * v[3]) * sinphi;
             rot[_c][3] = spindle_vector[3] * dot + v[3] * cosphi + (-spindle_vector[2] * v[1] + spindle_vector[1] * v[2]) * sinphi;
         }
-        float * dstv[3] = { phi_mos_a_host, phi_mos_b_host, phi_mos_c_host };
+        Real * dstv[3] = { phi_mos_a_host, phi_mos_b_host, phi_mos_c_host };
         for (int mt = 0; mt < nmos; mt++) {
             const double * um = mosaic_umats + (long) mt * 9; /* row-major double[9] */
             int base = (pt * nmos + mt) * 3;
@@ -329,13 +471,13 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
                 } else {
                     newv[1] = rot[_c][1]; newv[2] = rot[_c][2]; newv[3] = rot[_c][3];
                 }
-                dstv[_c][base + 0] = (float) newv[1];
-                dstv[_c][base + 1] = (float) newv[2];
-                dstv[_c][base + 2] = (float) newv[3];
+                dstv[_c][base + 0] = make_real(newv[1]);
+                dstv[_c][base + 1] = make_real(newv[2]);
+                dstv[_c][base + 2] = make_real(newv[3]);
             }
         }
     }
-    float * cu_phi_mos_a = NULL; float * cu_phi_mos_b = NULL; float * cu_phi_mos_c = NULL;
+    Real * cu_phi_mos_a = NULL; Real * cu_phi_mos_b = NULL; Real * cu_phi_mos_c = NULL;
     CUDA_CHECK_RETURN(cudaMalloc((void ** )&cu_phi_mos_a, sizeof(*cu_phi_mos_a) * pm_count));
     CUDA_CHECK_RETURN(cudaMalloc((void ** )&cu_phi_mos_b, sizeof(*cu_phi_mos_b) * pm_count));
     CUDA_CHECK_RETURN(cudaMalloc((void ** )&cu_phi_mos_c, sizeof(*cu_phi_mos_c) * pm_count));
@@ -346,9 +488,9 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     sampleParams sample;
     sample.distance = distance;
     sample.close_distance = close_distance;
-    sample.water_F = water_F;
+    sample.water_F = make_real(water_F);
     sample.water_size = water_size;
-    sample.water_MW = water_MW;
+    sample.water_MW = make_real(water_MW);
 
     crystalParams crystal;
     crystal.default_F = default_F;
@@ -357,9 +499,9 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     crystal.Nb = Nb;
     crystal.Nc = Nc;
     crystal.uc.V_cell = V_cell;
-    doubleVectorToFloatVector(crystal.uc.a0, a0, VECTOR_SIZE);
-    doubleVectorToFloatVector(crystal.uc.b0, b0, VECTOR_SIZE);
-    doubleVectorToFloatVector(crystal.uc.c0, c0, VECTOR_SIZE);
+    make_real_vector(crystal.uc.a0, a0, VECTOR_SIZE);
+    make_real_vector(crystal.uc.b0, b0, VECTOR_SIZE);
+    make_real_vector(crystal.uc.c0, c0, VECTOR_SIZE);
     crystal.xtal_shape = xtal_shape;
     crystal.fhklParams.hkls = hkls;
     crystal.fhklParams.h_max = h_max;
@@ -403,8 +545,11 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     crystal.fhklParams.l_range = l_range_pad;
 
     constParams constants;
-    constants.Avogadro = Avogadro;
-    constants.r_e_sqr = r_e_sqr;
+    constants.Avogadro = make_real(Avogadro);
+    constants.r_e_sqr = make_real(r_e_sqr);
+    /* fold r_e_sqr * fluence once, in double, ahead of the per-precision split
+       (see water_bg / photon_scale). */
+    constants.r_e_sqr_fluence = make_real(r_e_sqr * fluence);
 
     detectorParams * cu_detector;
     CUDA_CHECK_RETURN(cudaMalloc((void ** )&cu_detector, sizeof(*cu_detector)));
@@ -435,8 +580,8 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     for (int i = 0; i < beam.sources; i++) {
         double unitSource[VECTOR_SIZE] = { 0.0, -source_X[i], -source_Y[i], -source_Z[i] };
         unitizeCPU(unitSource, unitSource);
-        doubleVectorToFloatVector(beam_sources[i].neg_unit_source_vector, unitSource, VECTOR_SIZE);
-        beam_sources[i].lambda = source_lambda[i];
+        make_real_vector(beam_sources[i].neg_unit_source_vector, unitSource, VECTOR_SIZE);
+        beam_sources[i].lambda = make_real(source_lambda[i]);
         beam_sources[i].intensity = source_I[i];
     }
     beamSource * cu_beam_sources = NULL;
@@ -567,9 +712,9 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
 /* crystal is const (the kernel never writes it) but deliberately NOT __restrict__: measured on
    sm_120, __restrict__ here costs +1 register for no speed change (it only re-routes ~14 loads
    onto the read-only cache). The register budget takes priority. */
-__global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ detector, const beamParams * __restrict__ beam, const goniometerParams * __restrict__ goniometer, const sampleParams * __restrict__ sample,
+static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ detector, const beamParams * __restrict__ beam, const goniometerParams * __restrict__ goniometer, const sampleParams * __restrict__ sample,
         const crystalParams * crystal, const constParams * __restrict__ constants, const beamSource * __restrict__ beam_sources, const float * __restrict__ Fhkl,
-        const float * __restrict__ phi_mos_a, const float * __restrict__ phi_mos_b, const float * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
+        const Real * __restrict__ phi_mos_a, const Real * __restrict__ phi_mos_b, const Real * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/,
         float * max_I_y_reduction /*out*/, bool * rangemap) {
 
@@ -589,9 +734,9 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
     const long sstride = gridDim.y * blockDim.y;
     const long stride = fstride * sstride;
 
-    /* add background from something amorphous */
-    const float F_bg = sample->water_F;
-    const float I_bg = F_bg * F_bg * constants->r_e_sqr * beam->fluence * sample->water_size * sample->water_size * sample->water_size * 1e6f * constants->Avogadro / sample->water_MW;
+    /* background intensity from amorphous water; see water_bg's overloads below for
+       the per-precision expressions. */
+    const float I_bg = water_bg(sample->water_F, constants->r_e_sqr, beam->fluence, constants->r_e_sqr_fluence, sample->water_size, constants->Avogadro, sample->water_MW);
 
     for (long pixIdx = (blockDim.y * blockIdx.y + threadIdx.y) * fstride + blockDim.x * blockIdx.x + threadIdx.x; pixIdx < total_pixels; pixIdx += stride) {
         const short fpixel = pixIdx % detector->fpixels;
@@ -626,49 +771,49 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
         /* loop over sub-pixels */
         for (short subS = 0; subS < detector->oversample; ++subS) { /* Y voxel */
             for (short subF = 0; subF < detector->oversample; ++subF) { /* X voxel */
-                /* absolute mm position of this sub-pixel on the detector (relative to
-                   its origin). Fdet/Sdet are computed in float; this is the start of the
-                   pixel_pos -> diffracted -> scattering -> h,k,l -> sincg geometry chain,
-                   which is float throughout. */
-                const float subpix = detector->subpixel_size;
-                float Fdet = subpix * (fpixel * detector->oversample + subF) + subpix / 2.0f; /* X voxel */
-                float Sdet = subpix * (spixel * detector->oversample + subS) + subpix / 2.0f; /* Y voxel */
+                /* absolute mm position of this sub-pixel on the detector (relative to its
+                   origin). subpixel_size is the working-precision detector input; this is
+                   the start of the pixel_pos -> diffracted -> scattering -> h,k,l -> sincg
+                   geometry chain, carried at the working precision throughout. Only the
+                   float representative escapes to the reduction outputs. */
+                const Real subpix = detector->subpixel_size;
+                const float subF_count = (float) (fpixel * detector->oversample + subF);
+                const float subS_count = (float) (spixel * detector->oversample + subS);
+                Real Fdet = subpixel_coord(subpix, subF_count); /* X voxel */
+                Real Sdet = subpixel_coord(subpix, subS_count); /* Y voxel */
 
-                max_I_x_sub_reduction = Fdet;
-                max_I_y_sub_reduction = Sdet;
+                max_I_x_sub_reduction = real_to_float(Fdet);
+                max_I_y_sub_reduction = real_to_float(Sdet);
 
                 for (short thick_tic = 0; thick_tic < detector->detector_thicksteps; ++thick_tic) {
                     /* assume "distance" is to the front of the detector sensor layer */
-                    float Odet = (float) thick_tic * detector->detector_thickstep; /* Z Orthogonal voxel. */
+                    Real Odet = real_product((float) thick_tic, detector->detector_thickstep); /* Z Orthogonal voxel. */
 
                     /* construct detector subpixel position in 3D space: the pix0 origin
-                       plus Fdet/Sdet/Odet along the detector basis vectors. */
-                    const float p1 = detector->pix0_vector[1], p2 = detector->pix0_vector[2], p3 = detector->pix0_vector[3];
-                    float pixel_pos[4];
-                    pixel_pos[1] = Fdet * detector->fdet_vector[1] + Sdet * detector->sdet_vector[1] + Odet * detector->odet_vector[1] + p1; /* X */
-                    pixel_pos[2] = Fdet * detector->fdet_vector[2] + Sdet * detector->sdet_vector[2] + Odet * detector->odet_vector[2] + p2; /* Y */
-                    pixel_pos[3] = Fdet * detector->fdet_vector[3] + Sdet * detector->sdet_vector[3] + Odet * detector->odet_vector[3] + p3; /* Z */
-                    pixel_pos[0] = 0.0;
+                       plus Fdet/Sdet/Odet along the detector basis vectors, at the working
+                       precision. */
+                    Real pixel_pos[4];
+                    pixel_pos[1] = detector_position(Fdet, Sdet, Odet, detector->fdet_vector[1], detector->sdet_vector[1], detector->odet_vector[1], detector->pix0_vector[1]); /* X */
+                    pixel_pos[2] = detector_position(Fdet, Sdet, Odet, detector->fdet_vector[2], detector->sdet_vector[2], detector->odet_vector[2], detector->pix0_vector[2]); /* Y */
+                    pixel_pos[3] = detector_position(Fdet, Sdet, Odet, detector->fdet_vector[3], detector->sdet_vector[3], detector->odet_vector[3], detector->pix0_vector[3]); /* Z */
+                    pixel_pos[0] = make_real(0.0f);
 
                     if (detector->curved_detector) {
-                        /* construct detector pixel that is always "distance" from the sample,
-                           operating directly on pixel_pos[]. */
+                        /* construct detector pixel that is always "distance" from the sample. */
                         float dbvector[4];
                         dbvector[1] = sample->distance * beam->beam_vector[1];
                         dbvector[2] = sample->distance * beam->beam_vector[2];
                         dbvector[3] = sample->distance * beam->beam_vector[3];
-                        /* treat detector pixel coordinates as radians */
-                        float newvector[4];
-                        rotate_axis(dbvector, newvector, detector->sdet_vector, pixel_pos[2] / sample->distance);
-                        rotate_axis(newvector, pixel_pos, detector->fdet_vector, pixel_pos[3] / sample->distance);
+                        curved_position(detector->sdet_vector, detector->fdet_vector, sample->distance, dbvector, pixel_pos);
                     }
 
-                    /* construct the diffracted-beam unit vector to this sub-pixel via
-                       unitize(). The same diffracted[] feeds BOTH the correction block
-                       (airpath, omega_pixel, parallax, polarization) and the scattering ->
-                       h,k,l -> sincg chain. */
-                    float diffracted[4];
-                    float airpath = unitize(pixel_pos, diffracted);
+                    /* Working-precision diffracted ray for the scattering chain, plus a float
+                       representative (airpath + diffracted_f) that feeds the correction factors
+                       below; see diffracted_ray's overloads for the per-precision derivation. */
+                    float diffracted_f[4];
+                    float airpath = unitize(pixel_pos, diffracted_f);
+                    Real diffracted[4];
+                    diffracted_ray(diffracted_f, pixel_pos, diffracted);
 
                     /* solid angle subtended by a pixel: (pix/airpath)^2*cos(2theta) */
                     float omega_pixel = detector->pixel_size * detector->pixel_size / airpath / airpath * sample->close_distance / airpath;
@@ -685,13 +830,14 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
                     float capture_fraction = 1.0;
                     if (detector->detector_thick > 0.0f) {
                         /* inverse of effective thickness increase: dot product of odet_vector
-                           and diffracted. odet_vector is read via __ldg as a caching hint; it
+                           and the float representative of the diffracted ray, via parallax().
+                           odet_vector is read via __ldg as a caching hint inside parallax(); it
                            lives in a read-only const-restrict struct, so this changes no results
                            but lets ptxas schedule this cold branch's loads independently of the
                            hot pixel_pos/geometry loads, relieving register pressure. */
-                        float parallax = __ldg(&detector->odet_vector[1]) * diffracted[1] + __ldg(&detector->odet_vector[2]) * diffracted[2] + __ldg(&detector->odet_vector[3]) * diffracted[3];
-                        capture_fraction = exp(-thick_tic * detector->detector_thickstep * detector->detector_mu / parallax)
-                                - exp(-(thick_tic + 1) * detector->detector_thickstep * detector->detector_mu / parallax);
+                        float parallax_dot = parallax(detector->odet_vector, diffracted_f);
+                        capture_fraction = exp(-thick_tic * detector->detector_thickstep * detector->detector_mu / parallax_dot)
+                                - exp(-(thick_tic + 1) * detector->detector_thickstep * detector->detector_mu / parallax_dot);
                     }
 
                     /* Add the water background once, scaled by this sub-pixel's solid
@@ -705,19 +851,22 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
                     /* loop over sources now */
                     for (short source = 0; source < beam->sources; ++source) {
 
-                        /* read this source's wavelength via __ldg: beam_sources is constant
-                           for the whole launch and every thread reads the same entries, so
-                           routing the load through the read-only data cache serves it from
-                           cache instead of issuing a regular global load. */
-                        float lambda = __ldg(&beam_sources[source].lambda);
+                        /* read this source's wavelength and unit vector via __ldg: beam_sources
+                           is constant for the whole launch and every thread reads the same
+                           entries, so routing the loads through the read-only data cache serves
+                           them from cache instead of issuing regular global loads. Both are
+                           carried at the working precision; float representatives feed the
+                           resolution heuristic and the polarization incident vector. */
+                        Real lambda = __ldg(&beam_sources[source].lambda);
+                        Real neg_src[VECTOR_SIZE];
+                        neg_src[1] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
+                        neg_src[2] = __ldg(&beam_sources[source].neg_unit_source_vector[2]);
+                        neg_src[3] = __ldg(&beam_sources[source].neg_unit_source_vector[3]);
 
-                        /* construct the float scattering vector for this pixel from diffracted[].
-                           The same scattering[] feeds both the dmin/stol cutoff below and the
-                           h,k,l dot product further down. */
+                        /* float scattering vector from the float representative of the diffracted
+                           ray, for the dmin/stol resolution cutoff only. */
                         float scattering[4];
-                        scattering[1] = (diffracted[1] - __ldg(&beam_sources[source].neg_unit_source_vector[1])) / lambda;
-                        scattering[2] = (diffracted[2] - __ldg(&beam_sources[source].neg_unit_source_vector[2])) / lambda;
-                        scattering[3] = (diffracted[3] - __ldg(&beam_sources[source].neg_unit_source_vector[3])) / lambda;
+                        scattering_vector(diffracted_f, neg_src, lambda, scattering);
 
                         /* sin(theta)/lambda is half the scattering vector length */
                         float stol = (float)0.5 * norm3d_fma_rn(scattering[1], scattering[2], scattering[3]);
@@ -729,16 +878,21 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
                             }
                         }
 
+                        /* working-precision scattering vector (diffracted - source)/lambda,
+                           feeding the h,k,l projection; block-scoped, consumed below. */
+                        Real sc[VECTOR_SIZE];
+                        scattering_vector(diffracted, neg_src, lambda, sc);
+
                         /* Compute the polarization factor once per pixel (from the first
                            source) and reuse it, matching the CPU reference; the boolean flag
                            keeps the guard uniform across the warp (no divergence). */
                         if (beam->calc_polar && !polar_computed) {
                             /* need to compute polarization factor */
                             float incident[4];
-                            incident[1] = __ldg(&beam_sources[source].neg_unit_source_vector[1]);
-                            incident[2] = __ldg(&beam_sources[source].neg_unit_source_vector[2]);
-                            incident[3] = __ldg(&beam_sources[source].neg_unit_source_vector[3]);
-                            polar = polarization_factor(beam->polarization, incident, diffracted, beam->polar_vector);
+                            incident[1] = real_to_float(neg_src[1]);
+                            incident[2] = real_to_float(neg_src[2]);
+                            incident[3] = real_to_float(neg_src[3]);
+                            polar = polarization_factor(beam->polarization, incident, diffracted_f, beam->polar_vector);
                             polar_computed = true;
                         }
 
@@ -748,7 +902,16 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
                             /* enumerate mosaic domains */
                             for (short mos_tic = 0; mos_tic < crystal->mosaic_domains; ++mos_tic) {
 
+                                /* Outputs of the lattice-shape block below, all single precision:
+                                   the Miller indices h,k,l (the round crystal shapes need their
+                                   radial distance from the nearest reflection), the nearest
+                                   reflection h0,k0,l0 (the structure-factor lookup index), and the
+                                   reduced fractional offset dh,dk,dl (the square-crystal shape
+                                   transform). Only these plain values cross out; no working-precision
+                                   value leaves the block. */
                                 float h, k, l;
+                                short h0, k0, l0;
+                                float dh, dk, dl;
                                 {
                                     /* The fully phi+mosaic-rotated cell a/b/c was precomputed on the
                                        host (see the phi_mos_* precompute above) and is looked up here,
@@ -757,27 +920,33 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
                                        [(phi_tic*mosaic_domains + mos_tic)*3 + {0,1,2}] carry the rotated
                                        a/b/c components {1,2,3}. At phi==0 with no mosaic umat the
                                        rotation is an exact identity, so these equal the base cell
-                                       (float)a0/b0/c0 to the bit. */
+                                       a0/b0/c0 to the bit. */
                                     const int pm = (phi_tic * crystal->mosaic_domains + mos_tic) * 3;
-                                    float a[4]; load_rotated_cell_ldg(phi_mos_a, a, pm);
-                                    float b[4]; load_rotated_cell_ldg(phi_mos_b, b, pm);
-                                    float c[4]; load_rotated_cell_ldg(phi_mos_c, c, pm);
+                                    Real a[VECTOR_SIZE]; load_rotated_cell_ldg(phi_mos_a, a, pm);
+                                    Real b[VECTOR_SIZE]; load_rotated_cell_ldg(phi_mos_b, b, pm);
+                                    Real c[VECTOR_SIZE]; load_rotated_cell_ldg(phi_mos_c, c, pm);
 
-                                    /* construct Miller indices */
-                                    h = dot_product(a, scattering);
-                                    k = dot_product(b, scattering);
-                                    l = dot_product(c, scattering);
+                                    /* construct Miller indices: project the rotated cell onto the
+                                       working-precision scattering vector sc built above */
+                                    Real hh = dot_product(a, sc);
+                                    Real kk = dot_product(b, sc);
+                                    Real ll = dot_product(c, sc);
+
+                                    /* single-precision Miller index (the round-shape radial distance) */
+                                    h = real_to_float(hh);
+                                    k = real_to_float(kk);
+                                    l = real_to_float(ll);
+
+                                    /* integer Miller indices of the nearest reflection */
+                                    h0 = nearest_hkl(hh);
+                                    k0 = nearest_hkl(kk);
+                                    l0 = nearest_hkl(ll);
+
+                                    /* reduce to fractional Miller indices */
+                                    dh = fractional(hh);
+                                    dk = fractional(kk);
+                                    dl = fractional(ll);
                                 }
-
-                                /* integer Miller indices of the nearest reflection */
-                                short h0 = nearest_hkl(h);
-                                short k0 = nearest_hkl(k);
-                                short l0 = nearest_hkl(l);
-
-                                /* reduce to fractional Miller indices */
-                                float dh = fractional(h);
-                                float dk = fractional(k);
-                                float dl = fractional(l);
 
                                 /* structure factor of the lattice (parallelepiped crystal)
                                  F_latt = sin(M_PI*Na*h)*sin(M_PI*Nb*k)*sin(M_PI*Nc*l)/sin(M_PI*h)/sin(M_PI*k)/sin(M_PI*l);
@@ -840,8 +1009,10 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
         }
         /* end of sub-pixel x loop */
         /* I holds the Bragg sum plus the solid-angle-scaled water background; apply
-           polarization and normalize by the sub-step count. */
-        const float photons = (constants->r_e_sqr * beam->fluence * polar * I) / detector->steps;
+           polarization and normalize by the sub-step count. The df64 form carries the
+           folded r_e_sqr*fluence scale through in compensated pairs, popping to a single
+           float here; the single form is the base scale expression. */
+        const float photons = photon_scale(constants->r_e_sqr, beam->fluence, constants->r_e_sqr_fluence, polar, I, detector->steps);
         floatimage[j] = photons;
         omega_reduction[j] = omega_sub_reduction;
         max_I_x_reduction[j] = max_I_x_sub_reduction;
@@ -850,14 +1021,8 @@ __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ det
     }
 }
 
-/* vector inner product where vector magnitude is 0th element */
-__device__ __inline__ static float dot_product(const float * x, const float * y) {
-    return x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
-}
-
 /* vector cross product where vector magnitude is 0th element */
-__device__ static float *cross_product(const float * x, const float * y,
-float * z) {
+__device__ static float *cross_product(const float * x, const float * y, float * z) {
     z[1] = x[2] * y[3] - x[3] * y[2];
     z[2] = x[3] * y[1] - x[1] * y[3];
     z[3] = x[1] * y[2] - x[2] * y[1];
@@ -873,34 +1038,8 @@ __device__ __inline__ float norm3d_fma_rn(float v1, float v2, float v3) {
     return sqrt(q_sqr);
 }
 
-/* make a unit vector pointing in same direction and report magnitude (both args can be same vector) */
-__device__ static float unitize(float * vector, float * new_unit_vector) {
-
-    float v1 = vector[1];
-    float v2 = vector[2];
-    float v3 = vector[3];
-
-    float mag = norm3d_fma_rn(v1, v2, v3);
-
-    if (mag != 0.0f) {
-        /* normalize it */
-        new_unit_vector[0] = mag;
-        new_unit_vector[1] = v1 / mag;
-        new_unit_vector[2] = v2 / mag;
-        new_unit_vector[3] = v3 / mag;
-    } else {
-        /* can't normalize, report zero vector */
-        new_unit_vector[0] = 0.0;
-        new_unit_vector[1] = 0.0;
-        new_unit_vector[2] = 0.0;
-        new_unit_vector[3] = 0.0;
-    }
-    return mag;
-}
-
 /* rotate a 3-vector about a unit vector axis */
-__device__ static float *rotate_axis(const float * __restrict__ v,
-float * newv, const float * __restrict__ axis, const float phi) {
+__device__ static float *rotate_axis(const float * __restrict__ v, float * newv, const float * __restrict__ axis, const float phi) {
 
     const float sinphi = sin(phi);
     const float cosphi = cos(phi);
@@ -935,25 +1074,13 @@ __device__ __inline__ float quickFcell_ldg(short hkls, short h0, short h_max, sh
 /* Copy one rotated cell vector (three components) from the host-precomputed table into
    out[]. Vectors in this codebase use a 4-element convention: element 0 holds the
    magnitude and elements 1..3 hold the x,y,z components. The magnitude is not needed
-   here, so out[0] is set to 0 and out[1], out[2], out[3] receive the three components,
-   read through the __ldg read-only cache. idx_base selects the table entry:
-   (phi_tic * mosaic_domains + mos_tic) * 3. */
-__device__ __forceinline__ void load_rotated_cell_ldg(const float * __restrict__ tbl, float out[4], int idx_base) {
-    out[0] = 0.0f;
+   here (the dot product reads only elements 1..3), so out[0] is left untouched and
+   out[1], out[2], out[3] receive the three components, read through the __ldg read-only
+   cache. idx_base selects the table entry: (phi_tic * mosaic_domains + mos_tic) * 3. */
+__device__ __forceinline__ void load_rotated_cell_ldg(const Real * __restrict__ tbl, Real out[4], int idx_base) {
     out[1] = __ldg(&tbl[idx_base + 0]);
     out[2] = __ldg(&tbl[idx_base + 1]);
     out[3] = __ldg(&tbl[idx_base + 2]);
-}
-
-/* nearest_hkl: integer Miller index of the nearest reciprocal-lattice point
-   (the Fhkl structure-factor lookup index) */
-__device__ __forceinline__ static short nearest_hkl(float h) {
-    return (short) ceilf(h - 0.5f);
-}
-
-/* fractional: distance from the nearest Bragg peak, reduced to |delta| <= 0.5 */
-__device__ __forceinline__ static float fractional(float h) {
-    return h - rintf(h);
 }
 
 /* Delta-reduced sincg: evaluates the N-slit interference function
@@ -1016,4 +1143,334 @@ __device__ static float polarization_factor(float kahn_factor, const float * __r
 
     /* correction for polarized incident beam */
     return 0.5f * (1.0f + cos2theta_sqr - kahn_factor * cos(2.0f * psi) * sin2theta_sqr);
+}
+
+/* --- df64 arithmetic and precision-selectable helpers ---------------------------
+   The compensated (hi, lo) primitives -- the error-free transforms df_two_sum /
+   df_two_prod / df_quick_two_sum and the double-float add/sub/mul/sqrt/div composed
+   from them -- and the Real overloads they back. These are selected only when Real is
+   float2; at single precision the float forms above are chosen and none of this is
+   reached. */
+
+/* error-free transform: the returned pair sums to a + b exactly */
+__device__ __inline__ static float2 df_two_sum(float a, float b) {
+    float s = a + b;
+    float bb = s - a;
+    float err = (a - (s - bb)) + (b - bb);
+    return make_float2(s, err);
+}
+
+/* error-free transform: the returned pair equals a * b exactly, one fused
+   multiply-add capturing the rounding remainder in the low word */
+__device__ __inline__ static float2 df_two_prod(float a, float b) {
+    float p = a * b;
+    float e = __fmaf_rn(a, b, -p);
+    return make_float2(p, e);
+}
+
+/* renormalizing sum valid when |a| >= |b| */
+__device__ __inline__ static float2 df_quick_two_sum(float a, float b) {
+    float s = a + b;
+    float err = b - (s - a);
+    return make_float2(s, err);
+}
+
+/* (hi, lo) + (hi, lo) */
+__device__ __inline__ static float2 df_add(float2 a, float2 b) {
+    float2 s = df_two_sum(a.x, b.x);
+    float2 t = df_two_sum(a.y, b.y);
+    s.y += t.x;
+    float2 r = df_quick_two_sum(s.x, s.y);
+    r.y += t.y;
+    r = df_quick_two_sum(r.x, r.y);
+    return r;
+}
+
+/* (hi, lo) * (hi, lo) */
+__device__ __inline__ static float2 df_mul(float2 a, float2 b) {
+    float2 p = df_two_prod(a.x, b.x);
+    float e = __fmaf_rn(a.x, b.y, __fmaf_rn(a.y, b.x, p.y));
+    return df_quick_two_sum(p.x, e);
+}
+
+/* (hi, lo) + float */
+__device__ __inline__ static float2 df_add_f(float2 a, float b) {
+    float2 s = df_two_sum(a.x, b);
+    s.y += a.y;
+    return df_quick_two_sum(s.x, s.y);
+}
+
+/* (hi, lo) * float */
+__device__ __inline__ static float2 df_mul_f(float2 a, float b) {
+    float2 p = df_two_prod(a.x, b);
+    float e = __fmaf_rn(a.y, b, p.y);
+    return df_quick_two_sum(p.x, e);
+}
+
+/* (hi, lo) - (hi, lo) */
+__device__ __inline__ static float2 df_sub(float2 a, float2 b) {
+    return df_add(a, make_float2(-b.x, -b.y));
+}
+
+/* (hi, lo) sqrt: single Newton correction from a float sqrt seed */
+__device__ __inline__ static float2 df_sqrt(float2 a) {
+    if (a.x == 0.0f) return make_float2(0.0f, 0.0f);
+    const float xn = rsqrtf(a.x);            /* approx 1/sqrt(a) */
+    const float yn = a.x * xn;               /* approx sqrt(a) */
+    const float2 yn_sqr = df_two_prod(yn, yn);
+    const float2 resid = df_sub(a, yn_sqr);  /* a - yn^2, as df */
+    return df_add_f(make_float2(yn, 0.0f), resid.x * (xn * 0.5f));
+}
+
+/* (hi, lo) / (hi, lo): one Newton correction from a float quotient seed */
+__device__ __inline__ static float2 df_div(float2 a, float2 b) {
+    const float xn = a.x / b.x;              /* approx quotient */
+    const float2 prod = df_mul_f(b, xn);     /* b*xn as df */
+    const float2 resid = df_sub(a, prod);    /* a - b*xn */
+    const float corr = resid.x / b.x;
+    return df_add_f(make_float2(xn, 0.0f), corr);
+}
+
+/* vector inner product where vector magnitude is 0th element */
+__device__ __inline__ static float dot_product(const float * x, const float * y) {
+    return x[1] * y[1] + x[2] * y[2] + x[3] * y[3];
+}
+
+/* compensated projection of a scattering vector onto a cell vector to form one
+   Miller index: accumulate the three (hi, lo) products into a running (hi, lo) sum,
+   keeping the full width of every partial. 4-element convention, element 0 unused. */
+__device__ __inline__ static float2 dot_product(const float2 * x, const float2 * y) {
+    float2 sum = make_float2(0.0f, 0.0f);
+    sum = df_add(sum, df_mul(x[1], y[1]));
+    sum = df_add(sum, df_mul(x[2], y[2]));
+    sum = df_add(sum, df_mul(x[3], y[3]));
+    return sum;
+}
+
+/* fractional: distance from the nearest Bragg peak, reduced to |delta| <= 0.5 */
+__device__ __forceinline__ static float fractional(float h) {
+    return h - rintf(h);
+}
+
+/* fractional offset of a carried value; the low word folds into the reduced offset,
+   which is small enough to hold in single precision */
+__device__ __forceinline__ static float fractional(float2 h) {
+    return (h.x - rintf(h.x)) + h.y;
+}
+
+/* nearest_hkl: integer Miller index of the nearest reciprocal-lattice point
+   (the Fhkl structure-factor lookup index) */
+__device__ __forceinline__ static short nearest_hkl(float h) {
+    return (short) ceilf(h - 0.5f);
+}
+
+/* nearest reciprocal-lattice point of a carried value; the nearest point is fixed by
+   the high word */
+__device__ __forceinline__ static short nearest_hkl(float2 h) {
+    return (short) ceilf(h.x - 0.5f);
+}
+
+/* widen a single-precision value into the working precision: identity for float,
+   zero low word for the compensated pair. NB_PRECISION aliases make_real to whichever
+   of these two names actually gets called, since both take this same float input and
+   differ only in their return type (see the selector above). */
+__device__ __forceinline__ static float make_real_float(float v) {
+    return v;
+}
+__device__ __forceinline__ static float2 make_real_double(float v) {
+    return make_float2(v, 0.0f);
+}
+
+/* the single-precision representative of a working-precision value: identity for
+   float, high word of the compensated pair */
+__device__ __forceinline__ static float real_to_float(float v) {
+    return v;
+}
+__device__ __forceinline__ static float real_to_float(float2 v) {
+    return v.x;
+}
+
+/* product of two single-precision values into the working precision (exact df pair).
+   NB_PRECISION aliases real_product the same way it aliases make_real, above, since
+   both forms share these float inputs and differ only in their return type. */
+__device__ __inline__ static float real_product_float(float a, float b) {
+    return a * b;
+}
+__device__ __inline__ static float2 real_product_double(float a, float b) {
+    return df_two_prod(a, b);
+}
+
+/* sub-pixel detector coordinate: subpix * count + subpix/2, base association at single
+   precision, compensated pairs at df64. */
+__device__ __inline__ static float subpixel_coord(float subpix, float count) {
+    return subpix * count + subpix / 2.0f;
+}
+__device__ __inline__ static float2 subpixel_coord(float2 subpix, float count) {
+    return df_add(df_mul_f(subpix, count), df_mul_f(subpix, 0.5f));
+}
+
+/* one detector-basis position component: Fdet*fv + Sdet*sv + Odet*ov + pv. The single
+   form keeps the base left-to-right association; the df64 form pairs the products as the
+   compensated chain does. */
+__device__ __inline__ static float detector_position(float Fdet, float Sdet, float Odet, float fv, float sv, float ov, float pv) {
+    return Fdet * fv + Sdet * sv + Odet * ov + pv;
+}
+__device__ __inline__ static float2 detector_position(float2 Fdet, float2 Sdet, float2 Odet, float2 fv, float2 sv, float2 ov, float2 pv) {
+    return df_add(df_add(df_mul(Fdet, fv), df_mul(Sdet, sv)), df_add(df_mul(Odet, ov), pv));
+}
+
+/* working-precision diffracted ray. The single form reuses the already-computed float
+   unit vector (the correction block's unitize output). The df64 form normalizes the df
+   pixel position directly (df sqrt + df divide) so the compensated position carries into
+   the scattering vector without truncation. */
+__device__ __inline__ static void diffracted_ray(const float * diffracted_f, const float * pixel_pos, float * diffracted) {
+    diffracted[1] = diffracted_f[1];
+    diffracted[2] = diffracted_f[2];
+    diffracted[3] = diffracted_f[3];
+}
+__device__ __inline__ static void diffracted_ray(const float * diffracted_f, const float2 * pixel_pos, float2 * diffracted) {
+    const float2 px1 = pixel_pos[1], px2 = pixel_pos[2], px3 = pixel_pos[3];
+    const float2 magd_sqr = df_add(df_add(df_mul(px1, px1), df_mul(px2, px2)), df_mul(px3, px3));
+    const float2 magd = df_sqrt(magd_sqr);
+    if (magd.x != 0.0f) {
+        diffracted[0] = magd;
+        diffracted[1] = df_div(px1, magd);
+        diffracted[2] = df_div(px2, magd);
+        diffracted[3] = df_div(px3, magd);
+    } else {
+        diffracted[0] = diffracted[1] = diffracted[2] = diffracted[3] = make_float2(0.0f, 0.0f);
+    }
+}
+
+/* working-precision scattering vector sc = (diffracted - source)/lambda, 4-element
+   convention with element 0 unused. Single: plain float subtract + divide. df64: a
+   compensated subtract + divide on both operands. */
+__device__ __inline__ static void scattering_vector(const float * diffracted, const float * neg_source, float lambda, float * sc) {
+    sc[1] = (diffracted[1] - neg_source[1]) / lambda;
+    sc[2] = (diffracted[2] - neg_source[2]) / lambda;
+    sc[3] = (diffracted[3] - neg_source[3]) / lambda;
+}
+__device__ __inline__ static void scattering_vector(const float2 * diffracted, const float2 * neg_source, float2 lambda, float2 * sc) {
+    sc[1] = df_div(df_sub(diffracted[1], neg_source[1]), lambda);
+    sc[2] = df_div(df_sub(diffracted[2], neg_source[2]), lambda);
+    sc[3] = df_div(df_sub(diffracted[3], neg_source[3]), lambda);
+}
+
+/* float pre-filter at the dmin site: narrows the Real source vector and lambda to
+   feed the cheap resolution cutoff, ahead of the working-precision vector above. At
+   single precision this signature coincides with the float form above, so the same
+   function serves both call sites; only df64 needs this as a distinct overload. */
+__device__ __inline__ static void scattering_vector(const float * diffracted_f, const float2 * neg_src, float2 lambda, float * scattering) {
+    scattering[1] = (diffracted_f[1] - real_to_float(neg_src[1])) / real_to_float(lambda);
+    scattering[2] = (diffracted_f[2] - real_to_float(neg_src[2])) / real_to_float(lambda);
+    scattering[3] = (diffracted_f[3] - real_to_float(neg_src[3])) / real_to_float(lambda);
+}
+
+/* inverse of effective detector-thickness increase: dot product of odet_vector and the
+   float representative of the diffracted ray. odet_vector is read via __ldg as a
+   caching hint; it lives in a read-only const-restrict struct, so this changes no
+   results but lets ptxas schedule this cold branch's loads independently of the hot
+   pixel_pos/geometry loads, relieving register pressure. The df64 form narrows each
+   __ldg'd component with real_to_float before the product, on the same loads. */
+__device__ __inline__ static float parallax(const float * __restrict__ odet, const float * diffracted_f) {
+    return __ldg(&odet[1]) * diffracted_f[1] + __ldg(&odet[2]) * diffracted_f[2] + __ldg(&odet[3]) * diffracted_f[3];
+}
+__device__ __inline__ static float parallax(const float2 * __restrict__ odet, const float * diffracted_f) {
+    return real_to_float(__ldg(&odet[1])) * diffracted_f[1] + real_to_float(__ldg(&odet[2])) * diffracted_f[2] + real_to_float(__ldg(&odet[3])) * diffracted_f[3];
+}
+
+/* curved-detector pixel rotation: construct a detector pixel that is always "distance"
+   from the sample by rotating pixel_pos about sdet_vector then fdet_vector. The float
+   form is the base kernel's exact rotation, operating directly on pixel_pos. The df64
+   form narrows pixel_pos/sdet_vector/fdet_vector to float, performs the same two
+   rotations in the same order, then widens the result back into pixel_pos (an exact
+   widening of a float-exact value). */
+__device__ __inline__ static void curved_position(const float * sdet_vector, const float * fdet_vector, float distance,
+        const float * dbvector, float * pixel_pos) {
+    float newvector[4];
+    rotate_axis(dbvector, newvector, sdet_vector, pixel_pos[2] / distance);
+    rotate_axis(newvector, pixel_pos, fdet_vector, pixel_pos[3] / distance);
+}
+__device__ __inline__ static void curved_position(const float2 * sdet_vector, const float2 * fdet_vector, float distance,
+        const float * dbvector, float2 * pixel_pos) {
+    float ppos_f[4] = { real_to_float(pixel_pos[0]), real_to_float(pixel_pos[1]), real_to_float(pixel_pos[2]), real_to_float(pixel_pos[3]) };
+    float sdet_f[4] = { real_to_float(sdet_vector[0]), real_to_float(sdet_vector[1]), real_to_float(sdet_vector[2]), real_to_float(sdet_vector[3]) };
+    float fdet_f[4] = { real_to_float(fdet_vector[0]), real_to_float(fdet_vector[1]), real_to_float(fdet_vector[2]), real_to_float(fdet_vector[3]) };
+    float newvector[4];
+    rotate_axis(dbvector, newvector, sdet_f, ppos_f[2] / distance);
+    rotate_axis(newvector, ppos_f, fdet_f, ppos_f[3] / distance);
+    /* this overload only ever runs when Real is float2, so the widen-back calls
+       make_real_double directly rather than through the NB_PRECISION-aliased name:
+       this function body is unconditionally compiled at both precisions (like every
+       float2 overload in this file), and the alias tracks the active compile pass,
+       not which overload is executing it. */
+    pixel_pos[1] = make_real_double(ppos_f[1]);
+    pixel_pos[2] = make_real_double(ppos_f[2]);
+    pixel_pos[3] = make_real_double(ppos_f[3]);
+}
+
+/* make a unit vector pointing in same direction and report magnitude (both args can
+   be same vector) */
+__device__ static float unitize(float * vector, float * new_unit_vector) {
+
+    float v1 = vector[1];
+    float v2 = vector[2];
+    float v3 = vector[3];
+
+    float mag = norm3d_fma_rn(v1, v2, v3);
+
+    if (mag != 0.0f) {
+        /* normalize it */
+        new_unit_vector[0] = mag;
+        new_unit_vector[1] = v1 / mag;
+        new_unit_vector[2] = v2 / mag;
+        new_unit_vector[3] = v3 / mag;
+    } else {
+        /* can't normalize, report zero vector */
+        new_unit_vector[0] = 0.0;
+        new_unit_vector[1] = 0.0;
+        new_unit_vector[2] = 0.0;
+        new_unit_vector[3] = 0.0;
+    }
+    return mag;
+}
+
+/* the working-precision overload narrows the pixel position to float, then calls the
+   plain-float form above with the same math in the same order */
+__device__ static float unitize(float2 * vector, float * new_unit_vector) {
+    float v[4] = { real_to_float(vector[0]), real_to_float(vector[1]), real_to_float(vector[2]), real_to_float(vector[3]) };
+    return unitize(v, new_unit_vector);
+}
+
+/* amorphous water background intensity per sub-pixel. Single: the base linear chain,
+   using r_e_sqr and fluence separately. df64: the compensated chain using the folded
+   r_e_sqr*fluence pair, popped to a single float. */
+__device__ __inline__ static float water_bg(float water_F, float r_e_sqr, float fluence, float r_e_sqr_fluence,
+        float water_size, float Avogadro, float water_MW) {
+    return water_F * water_F * r_e_sqr * fluence * water_size * water_size * water_size * 1e6f * Avogadro / water_MW;
+}
+__device__ __inline__ static float water_bg(float2 water_F, float2 r_e_sqr, float2 fluence, float2 r_e_sqr_fluence,
+        float water_size, float2 Avogadro, float2 water_MW) {
+    float2 I_bg_df = df_mul(water_F, water_F);
+    I_bg_df = df_mul(I_bg_df, r_e_sqr_fluence);
+    I_bg_df = df_mul_f(I_bg_df, water_size);
+    I_bg_df = df_mul_f(I_bg_df, water_size);
+    I_bg_df = df_mul_f(I_bg_df, water_size);
+    I_bg_df = df_mul_f(I_bg_df, 1e6f);
+    I_bg_df = df_mul(I_bg_df, Avogadro);
+    I_bg_df = df_div(I_bg_df, water_MW);
+    return I_bg_df.x + I_bg_df.y;
+}
+
+/* photons-per-pixel scale: r_e_sqr * fluence * polar * I / steps. Single: the base
+   scale expression, using r_e_sqr and fluence separately. df64: the compensated chain
+   using the folded r_e_sqr*fluence pair, popped to a single float. */
+__device__ __inline__ static float photon_scale(float r_e_sqr, float fluence, float r_e_sqr_fluence, float polar, float I, long steps) {
+    return (r_e_sqr * fluence * polar * I) / steps;
+}
+__device__ __inline__ static float photon_scale(float2 r_e_sqr, float2 fluence, float2 r_e_sqr_fluence, float polar, float I, long steps) {
+    float2 photons_df = df_mul_f(r_e_sqr_fluence, polar);
+    photons_df = df_mul_f(photons_df, I);
+    photons_df = df_div(photons_df, make_float2((float) steps, 0.0f));
+    return photons_df.x + photons_df.y;
 }
