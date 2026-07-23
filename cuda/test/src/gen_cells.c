@@ -12,6 +12,11 @@
  *               (4x4x5x4 = 320). Reproduces run_parity_suite_5090.sh cell-for-cell.
  *   coverage -- main-effects: a baseline cell, then one cell per (dimension,value)
  *               that differs from the dimension baseline (only that dim changed).
+ *   guards   -- hand-authored scenarios (build_scenarios) whose plan line carries
+ *               "gate":"reject": cells the GPU kernel MUST refuse (exit 9) rather
+ *               than silently misbehave. run.sh renders GPU-only, no CPU oracle.
+ *   perf     -- hand-authored scenarios (build_scenarios), ordinary parity cells
+ *               tagged for timing (min-of-5, warn-not-fail in run.sh).
  *
  * No jq / no Python: JSON is parsed here. Number tokens are preserved verbatim
  * (so "231.27", "1e18", "1.0" round-trip exactly into the CLI).
@@ -491,11 +496,15 @@ static void json_put_cost(FILE *f, const toklist *t) {
     fprintf(f, "{\"compute\":%lld,\"precision\":%lld,\"memory\":null}", compute, precision);
 }
 
-/* Emit one full cell line. axes_* are label strings; N is the crystal_size label. */
+/* Emit one full cell line. axes_* are label strings; N is the crystal_size label.
+   gate_type is NULL/"parity" for an ordinary parity cell (emits nothing extra,
+   keeping grid320/coverage byte-identical) or "reject" for a guards cell (emits
+   an explicit "gate_type":"reject" field; run.sh routes it to the reject-gate
+   path instead of the CPU-oracle parity path). */
 static void emit_cell(FILE *f, spec *S, const char *id, const char *suite,
                       const char *ax_crystal, const char *ax_N, const char *ax_regime,
                       const char *ax_orient, const char *tags[], int ntags,
-                      const toklist *gpu, const toklist *cpu) {
+                      const toklist *gpu, const toklist *cpu, const char *gate_type) {
     fputc('{', f);
     fprintf(f, "\"id\":"); json_puts_escaped(f, id);
     fprintf(f, ",\"suite\":"); json_puts_escaped(f, suite);
@@ -513,6 +522,8 @@ static void emit_cell(FILE *f, spec *S, const char *id, const char *suite,
     fprintf(f, ",\"gate\":"); json_put_gate(f, S);
     fprintf(f, ",\"gpu_args\":"); json_put_argstr(f, gpu);
     fprintf(f, ",\"cpu_args\":"); json_put_argstr(f, cpu);
+    if (gate_type && strcmp(gate_type, "reject") == 0)
+        fprintf(f, ",\"gate_type\":\"reject\"");
     fputc('}', f);
     fputc('\n', f);
 }
@@ -560,7 +571,7 @@ static int build_grid320(spec *S, FILE *out) {
         push_extra(&cpu, orr[d], "cpu_extra");
 
         const char *tags[4] = { group_name(cr[a]), group_name(sz[b]), group_name(rg[c]), group_name(orr[d]) };
-        emit_cell(out, S, id, "grid320", lc, ls, lr, lo, tags, 4, &gpu, &cpu);
+        emit_cell(out, S, id, "grid320", lc, ls, lr, lo, tags, 4, &gpu, &cpu, NULL);
         count++;
     }
     free(cr); free(sz); free(rg); free(orr);
@@ -634,6 +645,8 @@ static int build_scenarios(spec *S, FILE *out, const char *suite) {
         jval *jcr = jget(p, "crystal");
         jval *jsz = jget(p, "size");
         jval *jargs = jget(p, "args");
+        jval *jgate = jget(p, "gate");           /* "reject" for a guards cell; absent = parity */
+        const char *gate_type = (jgate && jgate->t == JSTR) ? jgate->s : NULL;
         if (!jcr || jcr->t != JSTR || !jsz || jsz->t != JSTR)
             die("scenario missing crystal/size");
         jval *gcr = group_by_name(S, jcr->s);
@@ -660,7 +673,7 @@ static int build_scenarios(spec *S, FILE *out, const char *suite) {
                 if (jtags->arr[k]->t == JSTR) tags[nt++] = jtags->arr[k]->s;
 
         emit_cell(out, S, scn->s, suite, group_label(gcr), group_label(gsz),
-                  NULL, NULL, tags, nt, &gpu, &cpu);
+                  NULL, NULL, tags, nt, &gpu, &cpu, gate_type);
         count++;
     }
     return count;
@@ -694,7 +707,7 @@ static int build_coverage(spec *S, FILE *out) {
         toklist cpu; tl_init(&cpu);
         for (int i = 0; i < gpu.n; i++) tl_push(&cpu, gpu.tok[i]);
         const char *tags[2] = { bc, bs };
-        emit_cell(out, S, "baseline", "coverage", lc, ls, NULL, NULL, tags, 2, &gpu, &cpu);
+        emit_cell(out, S, "baseline", "coverage", lc, ls, NULL, NULL, tags, 2, &gpu, &cpu, NULL);
         count++;
     }
 
@@ -752,7 +765,7 @@ static int build_coverage(spec *S, FILE *out) {
             toklist cpu; tl_init(&cpu);
             for (int k = 0; k < gpu.n; k++) tl_push(&cpu, gpu.tok[k]);
             const char *tags[3] = { bc, bs, dn->s };
-            emit_cell(out, S, idbuf, "coverage", lc, ls, NULL, NULL, tags, 3, &gpu, &cpu);
+            emit_cell(out, S, idbuf, "coverage", lc, ls, NULL, NULL, tags, 3, &gpu, &cpu, NULL);
             count++;
         }
     }
@@ -789,8 +802,10 @@ int main(int argc, char **argv) {
     if (!out) { fprintf(stderr, "gen_cells: cannot write %s\n", outpath); return 2; }
 
     int count;
-    if (strcmp(suite, "grid320") == 0)      count = build_grid320(&S, out);
+    if (strcmp(suite, "grid320") == 0)       count = build_grid320(&S, out);
     else if (strcmp(suite, "coverage") == 0) count = build_coverage(&S, out);
+    else if (strcmp(suite, "guards") == 0)   count = build_scenarios(&S, out, "guards");
+    else if (strcmp(suite, "perf") == 0)     count = build_scenarios(&S, out, "perf");
     else { fprintf(stderr, "gen_cells: unknown suite '%s'\n", suite); if (outpath) fclose(out); return 2; }
 
     if (outpath) fclose(out);

@@ -48,6 +48,8 @@ to different suites.
   (4×4×5×4 = 320). Reproduces the canonical parity grid cell-for-cell.
 - `coverage` — main-effects: a baseline cell, then one cell per (dimension, value)
   that differs from that dimension's baseline (only that dimension changed).
+- `guards` — hand-authored cells the GPU kernel must REFUSE (see "Reject gate" below).
+- `perf` — hand-authored cells tagged for timing (see "Perf suite" below).
 
 ## Running
 
@@ -73,6 +75,32 @@ long suite can run as several foreground invocations that append to one
 Pearson correlation + sum-ratio, identical for fp32/df64/fp64. fp32 is held to the
 same gate deliberately, so float failures stay visible. `metrics` also prints
 `max_rel worst_pixel_frac peak_max_rel worst_is_peak` as diagnostics (not gated).
+
+## Reject gate / guards suite
+
+Some CLI options are not supported on the GPU kernel; the correct behavior is an
+explicit refusal (`exit 9`), never a silent no-op that renders something else.
+A cell whose plan line carries `"gate":"reject"` compiles with `"gate_type":"reject"`
+(a routine parity cell emits no `gate_type` field at all, so `grid320`/`coverage`
+stay byte-identical). `run.sh` routes a reject-gate cell down a separate path: no
+CPU oracle, no `metrics` — it renders the GPU kernel once and classifies by exit
+code: `9` → `REJECT` (expected), `0` → `FAIL` (silent no-op regression: it
+produced an image it should have refused), anything else → `BLOCKED`. `REJECT` is
+its own tally bucket (not folded into `BLOCKED`) and participates in golden
+comparison exactly like `PASS`/`FAIL` (a golden `REJECT` vs an actual `FAIL` or
+`BLOCKED` is a flip). The `guards` suite currently has one cell:
+`guard_interpolate` (explicit `-interpolate` must be GPU-rejected).
+
+## Perf suite (min-of-5, warn-not-fail)
+
+The `perf` suite is ordinary parity cells tagged for timing, kept at small
+compute-K (K ≤ 640) so their CPU oracles stay cheap. `run.sh` detects
+`SUITE_NAME=perf` and renders each cell's GPU kernel 5 times, keeping the MIN
+`ms` (warm/cold jitter) while still comparing against the CPU oracle once for
+`corr`/`sum_ratio`. The suite is warn-not-fail: a parity miss prints a
+`# perf-warn: <cell> corr=.. sr=..` diagnostic line but never gates — `TIER` is
+forced `PASS` and `run.sh` always exits 0 for this suite. No `perf` golden is
+ever required.
 
 ## Invariants (every cell)
 
@@ -103,6 +131,30 @@ eventual PR merge needs no edits here. If `cuda/workbench/nanoBragg_root` alread
 reproduces gold on both canaries it is reused; otherwise the freshly built gold is
 installed. Provenance is recorded in `testrun/cpu_manifest.txt`. A parity result
 measured against a reference that lacks either fix is invalid.
+
+## Layer 2 — performance ledger
+
+`run.sh` writes per-run results to an ephemeral `results.tsv` (Layer 1: one run,
+one file, overwritten/appended to next time). Layer 2 accumulates every run's
+provenance and per-cell rows permanently into two typed TSVs under `ledger/`:
+
+    ledger/runs.tsv     # run_id timestamp host gpu_name driver cpu_model commit
+                        #   suite precision kernel_md5 cpu_ref_md5
+    ledger/results.tsv  # run_id cell verdict corr sum_ratio ms
+
+joined by `run_id`. `ledger_append.sh <results.tsv> [ledger_dir]` parses a
+finished `results.tsv`'s `# key=value` trailer, derives
+`run_id = <UTCcompact>-<kernel_md5[0:8]>-<host>`, and appends one `runs.tsv` row
+plus one `results.tsv` row per cell. It is idempotent: re-running it on a
+`results.tsv` already ingested (same `run_id`) prints `already ingested: <run_id>`
+and appends nothing.
+
+`commit` in both the ledger and `run.sh`'s own summary trailer is a **build-time
+bake**: `metrics` is compiled with `-DNB_BUILD_COMMIT=<HEAD at compile time>`
+(see `Makefile`) and reports it via `metrics --build-commit`, rather than
+re-reading `git HEAD` at render time. Since `run.sh` runs `make` on every
+invocation, this equals HEAD-at-render on a stable branch; `gen_cells` itself
+stays commit-agnostic (its output is reviewed by diff, not stamped).
 
 ## Data
 

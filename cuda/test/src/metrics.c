@@ -3,6 +3,9 @@
  * Verbatim behavioral port of cuda/workbench/crystal_sweep/metrics_ext.py.
  *
  *   Usage: metrics <gpu_float32.bin> <cpu_float32.bin>
+ *          metrics --build-commit    (print the commit HEAD was at when this
+ *                                     binary was compiled, for the Layer-2
+ *                                     ledger's run provenance; see Makefile)
  *
  * Reads two little-endian float32 images, promotes to double, and prints:
  *
@@ -23,6 +26,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
+#include <string.h>
+
+#ifndef NB_BUILD_COMMIT
+#define NB_BUILD_COMMIT "unknown"
+#endif
 
 static float *read_f32(const char *path, size_t *count) {
     FILE *f = fopen(path, "rb");
@@ -42,6 +50,10 @@ static float *read_f32(const char *path, size_t *count) {
 }
 
 int main(int argc, char **argv) {
+    if (argc == 2 && strcmp(argv[1], "--build-commit") == 0) {
+        puts(NB_BUILD_COMMIT);
+        return 0;
+    }
     if (argc != 3) {
         fprintf(stderr, "Usage: %s <gpu_float32.bin> <cpu_float32.bin>\n", argv[0]);
         return 2;

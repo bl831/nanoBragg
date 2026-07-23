@@ -36,38 +36,55 @@ gather_provenance(){
   PROV_DRIVER="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)"
   PROV_CUDA="$(nvcc --version 2>/dev/null | grep -oE 'release [0-9.]+, V[0-9.]+' | head -1)"
   PROV_UTC="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  PROV_COMMIT="$(git -C "$REPO" rev-parse HEAD 2>/dev/null)"
+  # Build-time commit bake: metrics is compiled with -DNB_BUILD_COMMIT=<HEAD at
+  # compile time> (see Makefile), so this reports the commit `make` last compiled
+  # it at rather than re-reading git HEAD now. run.sh runs `make` on every
+  # invocation, so on this stable feature branch it equals HEAD-at-render; guard
+  # against metrics being missing (e.g. a stale $BIN before the first make).
+  if [ -x "$BIN/metrics" ]; then
+    PROV_COMMIT="$("$BIN/metrics" --build-commit 2>/dev/null)"
+  fi
   PROV_HOST="$(hostname 2>/dev/null || uname -n 2>/dev/null)"
-  : "${PROV_DRIVER:=unknown}" "${PROV_CUDA:=unknown}" "${PROV_COMMIT:=unknown}" "${PROV_HOST:=unknown}"
+  PROV_CPUMODEL="$(sed -n 's/^model name[[:space:]]*:[[:space:]]*//p' /proc/cpuinfo 2>/dev/null | head -1)"
+  : "${PROV_DRIVER:=unknown}" "${PROV_CUDA:=unknown}" "${PROV_COMMIT:=unknown}" "${PROV_HOST:=unknown}" "${PROV_CPUMODEL:=unknown}"
 }
 emit_provenance(){   # $1 = output file (appended)
   {
     echo "# driver=$PROV_DRIVER  cuda=\"$PROV_CUDA\""
     echo "# utc=$PROV_UTC  host=$PROV_HOST"
     echo "# commit=$PROV_COMMIT"
+    # Clean, greppable keys for ledger_append.sh (in addition to the free-form
+    # lines above): gpu_name pulled out of $DEVICE_EVIDENCE, cpu_model from
+    # gather_provenance, precision from the active $PRECISION run var.
+    echo "# gpu_name=$(sed -n 's/.*name="\([^"]*\)".*/\1/p' <<<"${DEVICE_EVIDENCE:-}")"
+    echo "# cpu_model=$PROV_CPUMODEL"
+    echo "# precision=${PRECISION:-unknown}"
   } >> "$1"
 }
 
 # --- golden seeding (bake mode) ----------------------------------------------
 # Upsert a baked cell's expected verdict into the committed golden via the
-# EXISTING golden format ('# ...' header comments + 'cell<TAB>verdict' rows).
-# Existing (routine) rows are left untouched.
-seed_golden(){   # $1 = cell id, $2 = verdict
-  local cell="$1" verdict="$2" gf="$GOLDEN" tmp
+# EXISTING golden format ('# ...' header comments + 'cell verdict corr sum_ratio'
+# rows, tab-separated). Existing (routine) rows are left untouched. corr/sum_ratio
+# are recorded alongside verdict for the Layer-2 ledger's drift columns, but the
+# gate below still reads/compares verdict only.
+seed_golden(){   # $1=cell $2=verdict $3=corr $4=sum_ratio
+  local cell="$1" verdict="$2" corr="${3:--}" sr="${4:--}" gf="$GOLDEN" tmp
   if [ ! -f "$gf" ]; then
     {
       printf '# golden expected-verdicts  suite=%s  precision=%s\n' "$SUITE_NAME" "$PRECISION"
       printf '# seeded by bake (NB_BAKE=1) / deathstar (NB_DEATHSTAR=1) mode: baked and\n'
       printf '# deathstar cells (compute-K over budget) whose CPU oracle was frozen once;\n'
       printf '# their expected verdict is recorded here.\n'
-      printf '# cell\tverdict\n'
+      printf '# cell\tverdict\tcorr\tsum_ratio\n'
     } > "$gf"
   fi
   if grep -q "^${cell}"$'\t' "$gf" 2>/dev/null; then
     tmp="$gf.bake.$$"
-    awk -v c="$cell" -v v="$verdict" 'BEGIN{FS=OFS="\t"} /^#/{print;next} $1==c{$2=v} {print}' "$gf" > "$tmp" && mv "$tmp" "$gf"
+    awk -v c="$cell" -v v="$verdict" -v cr="$corr" -v s="$sr" \
+        'BEGIN{FS=OFS="\t"} /^#/{print;next} $1==c{$2=v; $3=cr; $4=s} {print}' "$gf" > "$tmp" && mv "$tmp" "$gf"
   else
-    printf '%s\t%s\n' "$cell" "$verdict" >> "$gf"
+    printf '%s\t%s\t%s\t%s\n' "$cell" "$verdict" "$corr" "$sr" >> "$gf"
   fi
   echo "# bake: seeded golden row  $cell -> $verdict  ($gf)"
 }
@@ -246,6 +263,8 @@ fi
 NTOTAL="$(grep -c . "$CELLFILE")"
 PRECISION="${NB_PRECISION:-fp32}"
 GOLDEN="$TEST_DIR/golden/$SUITE_NAME.$PRECISION.tsv"
+# perf suite: min-of-5 timing, warn-not-fail (no perf golden is ever required).
+PERF=0; [ "$SUITE_NAME" = "perf" ] && PERF=1
 # The kernel's default precision is double; NB_PRECISION must be carried onto the
 # GPU render explicitly so it drives BOTH the golden file AND the actual arithmetic.
 # fp32 -> single, df64/fp64 -> double (the kernel's compiled double path). Without
@@ -320,6 +339,8 @@ while IFS= read -r line; do
   gpu_args_rel="$(sed -n 's/.*"gpu_args":"\([^"]*\)".*/\1/p' <<<"$line")"
   cpu_args_rel="$(sed -n 's/.*"cpu_args":"\([^"]*\)".*/\1/p' <<<"$line")"
   cpu_class="$(sed -n 's/.*"cpu_class":"\([^"]*\)".*/\1/p' <<<"$line")"
+  gate_type="$(sed -n 's/.*"gate_type":"\([^"]*\)".*/\1/p' <<<"$line")"
+  [ -n "$gate_type" ] || gate_type="parity"
   [ -n "$id" ] || { echo "WARN: unparseable cell line skipped" >&2; continue; }
 
   gpu_args="$(abspath_args "$gpu_args_rel")"
@@ -329,6 +350,29 @@ while IFS= read -r line; do
   # a stale scratch/Fdump.bin left by a previous -hkl cell. Remove it so the cell
   # uses its own structure factors. -hkl cells read their file directly (safe).
   case " $gpu_args " in *" -hkl "*) : ;; *) rm -f "$SCRATCH/Fdump.bin" ;; esac
+
+  # gate_type==reject (guards suite): a cell the GPU kernel MUST refuse rather
+  # than silently misbehave. No CPU oracle, no metrics -- render GPU-only and
+  # classify by exit code: 9=REJECT (expected), 0=FAIL (silent no-op
+  # regression, produced an image it should have refused), else BLOCKED.
+  if [ "$gate_type" = "reject" ]; then
+    gout="$OUTD/$id.bin"; rm -f "$gout"
+    t0=$(date +%s.%N)
+    ( cd "$SCRATCH" && "$KERNEL" -floatfile "$gout" $gpu_args $GPU_PREC_ARGS ) >"$SCRATCH/gpu_$id.log" 2>&1
+    rc=$?
+    t1=$(date +%s.%N)
+    ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f",(b-a)*1000.0}')
+    case "$rc" in
+      9) verdict="REJECT"; note="rejected(exit9)" ;;
+      0) verdict="FAIL";   note="silent-no-op-regression(exit0)" ;;
+      *) verdict="BLOCKED"; note="reject-unexpected(exit $rc)" ;;
+    esac
+    printf '%s\t-\t-\t%s\t%s\t%s\n' "$id" "$ms" "$verdict" "$note" >> "$RESULTS"
+    printf '%-34s %-11s %-10s %-8s %-8s %s\n' "$id" - - "$ms" "$verdict" "$note"
+    case "$verdict" in REJECT) npass=$((npass+1));; FAIL) nfail=$((nfail+1));; *) nother=$((nother+1));; esac
+    rm -f "$gout"
+    continue
+  fi
 
   # CPU reference. cpu_class (from gen_cells' compute-K budget) decides the policy:
   #   deathstar -- the hours-long, box-pinning extreme. Compare against the FROZEN
@@ -389,13 +433,25 @@ while IFS= read -r line; do
     fi
   fi
 
-  # GPU render (timed)
-  gout="$OUTD/$id.bin"; rm -f "$gout"
-  t0=$(date +%s.%N)
-  ( cd "$SCRATCH" && "$KERNEL" -floatfile "$gout" $gpu_args $GPU_PREC_ARGS ) >"$SCRATCH/gpu_$id.log" 2>&1
-  rc=$?
-  t1=$(date +%s.%N)
-  ms=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f",(b-a)*1000.0}')
+  # GPU render (timed). Perf suite: render N=5 and keep the MIN ms (warm/cold
+  # jitter); every other suite renders once (nrep=1 is a 1-iteration loop,
+  # identical to the old single render). corr/sum_ratio are still computed only
+  # once below, from the last successful render's output.
+  gout="$OUTD/$id.bin"
+  nrep=1; [ "$PERF" = "1" ] && nrep=5
+  ms=""; rc=0; rep=1
+  while [ "$rep" -le "$nrep" ]; do
+    rm -f "$gout"
+    t0=$(date +%s.%N)
+    ( cd "$SCRATCH" && "$KERNEL" -floatfile "$gout" $gpu_args $GPU_PREC_ARGS ) >"$SCRATCH/gpu_$id.log" 2>&1
+    rc=$?
+    t1=$(date +%s.%N)
+    ms_rep=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f",(b-a)*1000.0}')
+    [ $rc -ne 0 ] || [ ! -s "$gout" ] && break
+    if [ -z "$ms" ] || awk -v a="$ms_rep" -v b="$ms" 'BEGIN{exit !(a<b)}'; then ms="$ms_rep"; fi
+    rep=$((rep+1))
+  done
+  [ -n "$ms" ] || ms="$ms_rep"
   if [ $rc -ne 0 ] || [ ! -s "$gout" ]; then
     printf '%s\t-\t-\t%s\tBLOCKED\tgpu-fail(exit %s; %s)\n' "$id" "$ms" "$rc" "$SCRATCH/gpu_$id.log" >> "$RESULTS"
     printf '%-34s %-11s %-10s %-8s %-8s %s\n' "$id" - - "$ms" BLOCKED "gpu-fail(exit $rc)"
@@ -411,24 +467,29 @@ while IFS= read -r line; do
 
   verdict=$(awk -v c="$corr" -v s="$sr" -v cm="$CORR_MIN" -v sl="$SR_MIN" -v su="$SR_MAX" \
             'BEGIN{print (c>=cm && s>=sl && s<=su)?"PASS":"FAIL"}')
+  # perf suite is warn-not-fail: a parity miss is diagnosed, not gated (see the
+  # TIER/exit override below); no perf golden is ever required.
+  [ "$PERF" = "1" ] && [ "$verdict" = "FAIL" ] && echo "# perf-warn: $id corr=$corr sr=$sr"
   note="mr=$mr wpf=$wpf pmr=$pmr $wis"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$corr" "$sr" "$ms" "$verdict" "$note" >> "$RESULTS"
   printf '%-34s %-11s %-10s %-8s %-8s %s\n' "$id" "$corr" "$sr" "$ms" "$verdict" "$note"
   case "$verdict" in PASS) npass=$((npass+1));; FAIL) nfail=$((nfail+1));; esac
   # bake / deathstar mode seeds each frozen cell's expected verdict into golden.
-  [ "$BAKE_MODE" = "1" ] && [ "$cpu_class" = "baked" ] && seed_golden "$id" "$verdict"
-  [ "$DEATHSTAR_MODE" = "1" ] && [ "$cpu_class" = "deathstar" ] && seed_golden "$id" "$verdict"
+  [ "$BAKE_MODE" = "1" ] && [ "$cpu_class" = "baked" ] && seed_golden "$id" "$verdict" "$corr" "$sr"
+  [ "$DEATHSTAR_MODE" = "1" ] && [ "$cpu_class" = "deathstar" ] && seed_golden "$id" "$verdict" "$corr" "$sr"
   rm -f "$gout"
 done < "$CELLFILE"
 
 fi   # end render (non-score-only) block
 
 # --- raw tally over the WHOLE results.tsv (combines chunked/resumed runs) -----
-WP=0; WF=0; WB=0; WS=0; WT=0
+# REJECT (guards suite: GPU correctly refused, exit 9) is its own bucket, NOT
+# folded into BLOCKED -- it is the EXPECTED outcome for a reject-gate cell.
+WP=0; WF=0; WB=0; WS=0; WR=0; WT=0
 while IFS=$'\t' read -r nm _c _s _ms v _note; do
   case "$nm" in \#*|"") continue;; esac
   WT=$((WT+1))
-  case "$v" in PASS) WP=$((WP+1));; FAIL) WF=$((WF+1));; BLOCKED) WB=$((WB+1));; SKIP) WS=$((WS+1));; esac
+  case "$v" in PASS) WP=$((WP+1));; FAIL) WF=$((WF+1));; BLOCKED) WB=$((WB+1));; SKIP) WS=$((WS+1));; REJECT) WR=$((WR+1));; esac
 done < "$RESULTS"
 
 FINAL=0; [ "$RANGE_HI" -ge "$NTOTAL" ] && FINAL=1
@@ -459,7 +520,10 @@ GOLD_USED=0; NFLIP=0; FLIP_PF=0; FLIP_FP=0; FLIP_OTHER=0; GMATCH=0; flips=""
 if [ "$GOLDEN_EXISTS" -eq 1 ] && [ "$FINAL" -eq 1 ]; then
   GOLD_USED=1
   declare -A GOLD SEEN
-  while IFS=$'\t' read -r gc gv; do
+  # 4-col golden (cell verdict corr sum_ratio), backward-compatible with the
+  # older 2-col (cell verdict) format: a 2-col line leaves gcorr/gsr empty,
+  # which is fine since the gate below reads gv only.
+  while IFS=$'\t' read -r gc gv gcorr gsr; do
     case "$gc" in \#*|"") continue;; esac
     GOLD["$gc"]="$gv"
   done < "$GOLDEN"
@@ -474,6 +538,9 @@ if [ "$GOLDEN_EXISTS" -eq 1 ] && [ "$FINAL" -eq 1 ]; then
     elif [ "$v" = "$exp" ]; then
       GMATCH=$((GMATCH+1))
     else
+      # REJECT is handled by the generic string-equality match above (golden
+      # REJECT == actual REJECT is a GMATCH) and by the catch-all "*" arm here
+      # (golden REJECT vs actual FAIL/BLOCKED, or vice versa, IS a flip).
       case "$exp:$v" in
         PASS:FAIL) FLIP_PF=$((FLIP_PF+1)); flips+=$'\n'"    $nm : pass -> fail";;
         FAIL:PASS) FLIP_FP=$((FLIP_FP+1)); flips+=$'\n'"    $nm : fail -> pass";;
@@ -495,6 +562,10 @@ elif [ "$GOLDEN_EXISTS" -eq 1 ] && [ "$FINAL" -eq 0 ]; then
 else
   if [ "$WF" -eq 0 ] && [ "$WB" -eq 0 ]; then TIER="PASS"; else TIER="FAIL"; fi
 fi
+# perf suite is warn-not-fail: correctness misses are diagnosed (perf-warn lines
+# above), never gated. No perf golden is ever required, so TIER is forced PASS
+# regardless of raw FAILs or (absent) golden flips.
+[ "$PERF" = "1" ] && TIER="PASS"
 SUMMARY="TIER $SUITE_NAME $TIER $WP/$NTOTAL"
 
 # Append the summary block once the last cell has been run (never in score-only).
@@ -502,7 +573,7 @@ if [ "$FINAL" -eq 1 ] && [ "$SCORE_ONLY" != "1" ]; then
   gather_provenance
   {
     echo "# =============================================================="
-    echo "# $SUMMARY   (PASS=$WP FAIL=$WF BLOCKED=$WB SKIP=$WS  of $WT scored)"
+    echo "# $SUMMARY   (PASS=$WP FAIL=$WF BLOCKED=$WB SKIP=$WS REJECT=$WR  of $WT scored)"
     if [ "$GOLD_USED" -eq 1 ]; then
       echo "# golden=$GOLDEN  flips=$NFLIP (pass->fail=$FLIP_PF fail->pass=$FLIP_FP other=$FLIP_OTHER)"
     else
@@ -517,7 +588,7 @@ fi
 
 echo "# =============================================================="
 [ "$SCORE_ONLY" = "1" ] || echo "# this invocation: PASS=$npass FAIL=$nfail BLOCKED=$nother SKIP=$nskip"
-echo "$SUMMARY   (whole-file PASS=$WP FAIL=$WF BLOCKED=$WB SKIP=$WS of $WT scored)"
+echo "$SUMMARY   (whole-file PASS=$WP FAIL=$WF BLOCKED=$WB SKIP=$WS REJECT=$WR of $WT scored)"
 if [ "$GOLD_USED" -eq 1 ]; then
   if [ "$NFLIP" -eq 0 ]; then
     echo "# golden $SUITE_NAME.$PRECISION: 0 flips ($GMATCH/$WT cells match expected) -> suite PASS"
@@ -530,6 +601,9 @@ else
   echo "# no golden for $SUITE_NAME.$PRECISION ($GOLDEN); reporting raw counts"
 fi
 echo "# results -> $RESULTS   (render: column -t < $RESULTS)"
+
+# perf suite is warn-not-fail: always exit 0, regardless of FAIL/flips above.
+[ "$PERF" = "1" ] && exit 0
 
 if [ "$GOLD_USED" -eq 1 ]; then
   [ "$NFLIP" -eq 0 ] && exit 0 || exit 1
