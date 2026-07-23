@@ -803,7 +803,7 @@ int main(int argc, char** argv)
             {
                 spixels = atoi(argv[i+1]);
             }
-            if(strstr(argv[i], "-curved_det") && (argc > (i+1)))
+            if(strstr(argv[i], "-curved_det"))
             {
                 curved_detector = 1;
             }
