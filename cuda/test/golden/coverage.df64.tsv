@@ -1,0 +1,76 @@
+# golden expected-verdicts  suite=coverage  precision=df64
+# Committed source-of-truth (lockfile-style): each cell -> its EXPECTED PASS/FAIL
+# under the uniform gate (corr>=0.9999 AND sum_ratio in [0.999,1.001]). df64 is the
+# clean parity baseline: it matches the CPU oracle on every cell EXCEPT the two
+# curved-detector cells (cov_curved_det_on, curved_stress), which convict the D1
+# curved-detector float/geometry hole. A cell whose ACTUAL verdict FLIPS vs this
+# file (pass<->fail) is the regression signal; run.sh names the flipped cells.
+# provenance: seeded from the validated desktop-5090 df64 run (63 PASS / 2 FAIL of 65).
+# device: CUDA_DEVICE(active)=0 name="NVIDIA GeForce RTX 5090" SMs=170 cc=12.0 totalGiB=31.8
+# regenerate deliberately and review the diff, like cells/.
+# cell	verdict
+baseline	PASS
+cov_Na_10	PASS
+cov_Na_1000	PASS
+cov_Nb_10	PASS
+cov_Nb_1000	PASS
+cov_Nc_10	PASS
+cov_Nc_1000	PASS
+cov_mosaic_0.5	PASS
+cov_mosaic_1.0	PASS
+cov_mosaic_90	PASS
+cov_mosaic_domains_10	PASS
+cov_mosaic_domains_20	PASS
+cov_mosaic_domains_100	PASS
+cov_default_F_100	PASS
+cov_lambda_1.0	PASS
+cov_lambda_1.1	PASS
+cov_lambda_0.31	PASS
+cov_polar_0.9	PASS
+cov_polar_1.0	PASS
+cov_dispersion_2	PASS
+cov_dispersion_5	PASS
+cov_dispsteps_9	PASS
+cov_dispsteps_15	PASS
+cov_hdivrange_40	PASS
+cov_hdivrange_100	PASS
+cov_vdivrange_40	PASS
+cov_vdivrange_100	PASS
+cov_hdivsteps_5	PASS
+cov_hdivsteps_7	PASS
+cov_vdivsteps_5	PASS
+cov_vdivsteps_7	PASS
+cov_dmin_1.3	PASS
+cov_dmin_2.0	PASS
+cov_oversample_4	PASS
+cov_oversample_8	PASS
+cov_phi_45	PASS
+cov_phi_90	PASS
+cov_osc_0.1	PASS
+cov_osc_1.0	PASS
+cov_phisteps_10	PASS
+cov_phisteps_20	PASS
+cov_distance_150	PASS
+cov_distance_300	PASS
+cov_pixel_0.075	PASS
+cov_pixel_0.1	PASS
+cov_twotheta_20	PASS
+cov_twotheta_45	PASS
+cov_water_1	PASS
+cov_water_10	PASS
+cov_shape_round	PASS
+cov_convention_xds	PASS
+cov_convention_adxv	PASS
+cov_pivot_sample	PASS
+cov_point_pixel_on	PASS
+cov_curved_det_on	FAIL
+cov_nopolar_off	PASS
+cov_detector_rot_small	PASS
+cov_detector_rot_large	PASS
+offbeam	PASS
+custom_basis	PASS
+powder	PASS
+flat_control	PASS
+curved_stress	FAIL
+cancellation	PASS
+extreme_geom	PASS
