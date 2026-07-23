@@ -40,7 +40,7 @@ MANIFEST="$WORKDIR/cpu_manifest.txt"
 ROOT_BIN="$BENCH/nanoBragg_root"
 CRYST="$BENCH/crystals"
 SRC_FILE="nanoBragg.c"                                        # the root CPU oracle source
-FIX_BRANCHES=(fix/phi0-stale-rotation fix/subpixel-oversampling)
+FIX_BRANCHES=(fix/phi0-stale-rotation fix/subpixel-oversampling fix/curved-det-flag-guard)
 
 die(){ echo "ERROR: $*" >&2; exit 2; }
 mkdir -p "$BUILD" "$RUNDIR"
@@ -51,10 +51,15 @@ command -v gcc >/dev/null 2>&1 || die "gcc not found"
 BEAM="176.128000"
 BASE="-distance 231.27 -lambda 0.9768 -pixel 0.172 -detpixels 2048 -Xbeam $BEAM -Ybeam $BEAM -flux 1e18 -beamsize 1.0 -nonoise -nointerpolate -nopgm"
 C193L="-hkl $CRYST/193L.hkl -cell 78.540 78.540 37.770 90 90 90"
-CAN_NAMES=(canary_phi0 canary_subpixel)
+CAN_NAMES=(canary_phi0 canary_subpixel canary_curved)
 CAN_phi0="$C193L $BASE -Na 100 -Nb 100 -Nc 100 -oversample 1 -osc 0.1 -phisteps 10 -misset 0 0 0"
 CAN_subpixel="$C193L $BASE -Na 100 -Nb 100 -Nc 100 -oversample 2 -detector_thick 100 -detector_thicksteps 8 -detector_abs 100 -oversample_thick -phisteps 1 -misset 0 0 0"
-canary_args(){ case "$1" in canary_phi0) echo "$CAN_phi0";; canary_subpixel) echo "$CAN_subpixel";; esac; }
+# canary_curved: -curved_det is the LAST token, so it detects fix/curved-det-flag-guard.
+# The pre-fix parser silently drops a trailing -curved_det (renders flat); the fixed
+# parser honors it (curved). gold (fix applied) differs from main here iff the fix is
+# missing on main, and nanoBragg_root must reproduce gold's curved image.
+CAN_curved="$C193L $BASE -Na 100 -Nb 100 -Nc 100 -oversample 1 -misset 0 0 0 -curved_det"
+canary_args(){ case "$1" in canary_phi0) echo "$CAN_phi0";; canary_subpixel) echo "$CAN_subpixel";; canary_curved) echo "$CAN_curved";; esac; }
 
 # render a canary cell with a binary, return md5 of the float image
 render_md5(){ # <binary> <canary_name>
@@ -156,6 +161,7 @@ fi
   done
   echo "canary_phi0_cli    : $CAN_phi0"
   echo "canary_subpixel_cli: $CAN_subpixel"
+  echo "canary_curved_cli  : $CAN_curved"
 } > "$MANIFEST"
 
 echo "== CPU reference READY: $FINAL_BIN =="
