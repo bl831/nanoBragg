@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>   /* usleep for the host poll cadence */
 #include <driver_types.h>
 #include "nanotypes.h"
 #include "nanoBraggCUDA.h"
@@ -172,7 +173,8 @@ struct goniometerParams {
 static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restrict__ detectorPtr, const beamParams * __restrict__ beamPtr, const goniometerParams * __restrict__ goniometerPtr, const sampleParams * __restrict__ samplePtr,
         const crystalParams * crystalPtr, const constParams * __restrict__ constantsPtr, const beamSource * __restrict__ beam_sources, const float * __restrict__ Fhkl,
         const Real * __restrict__ phi_mos_a, const Real * __restrict__ phi_mos_b, const Real * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
-        float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap);
+        float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/, float * max_I_y_reduction /*out*/, bool * rangemap, unsigned int * progress,
+        unsigned int * progress_pub, int progress_meter);
 
 /* vector cross product where vector magnitude is 0th element */
 __device__ static float *cross_product(const float * x, const float * y, float * z);
@@ -355,9 +357,14 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
         int interpolate, double *** Fhkl, int h_min, int h_max, int h_range, int k_min, int k_max, int k_range, int l_min, int l_max, int l_range, int hkls,
         int nopolar, double polar_vector[4], double polarization, double fudge, int unsigned short * maskimage, float * floatimage /*out*/,
         double * omega_sum/*out*/, int * sumn /*out*/, double * sum /*out*/, double * sumsqr /*out*/, double * max_I/*out*/, double * max_I_x/*out*/,
-        double * max_I_y /*out*/) {
+        double * max_I_y /*out*/, int progress_meter) {
 
     int total_pixels = spixels * fpixels;
+
+    /* Enable host-mapped (zero-copy) allocations for the progress scalar. Must be the first CUDA
+       runtime call here, before any context-creating alloc, or cudaHostAlloc(...Mapped) later fails
+       with cudaErrorSetOnActiveProcess. */
+    CUDA_CHECK_RETURN(cudaSetDeviceFlags(cudaDeviceMapHost));
 
     bool * rangemap = (bool*) calloc(total_pixels, sizeof(bool));
     float * omega_reduction = (float*) calloc(total_pixels, sizeof(float));
@@ -626,27 +633,84 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     dim3 threadsPerBlock(THREADS_PER_BLOCK_X, THREADS_PER_BLOCK_Y);
     dim3 numBlocks(smCount * 32, 1);
 
+    unsigned int * cu_progress = NULL;                                      /* device-global fine counter */
+    CUDA_CHECK_RETURN(cudaMalloc((void **)&cu_progress, sizeof(unsigned int)));
+    CUDA_CHECK_RETURN(cudaMemset(cu_progress, 0, sizeof(unsigned int)));     /* per-launch reset */
+
+    unsigned int * h_progress = NULL;                                       /* host-mapped pinned scalar */
+    unsigned int * d_progress = NULL;                                       /* its device-side pointer */
+    CUDA_CHECK_RETURN(cudaHostAlloc((void **)&h_progress, sizeof(unsigned int), cudaHostAllocMapped));
+    *h_progress = 0;                                                        /* host-init: first read is a clean 0 */
+    CUDA_CHECK_RETURN(cudaHostGetDevicePointer((void **)&d_progress, h_progress, 0));
+
+    cudaStream_t kernelStream;
+    CUDA_CHECK_RETURN(cudaStreamCreate(&kernelStream));                     /* blocking; no poll stream needed */
+
     /* Time the kernel launch and print "KERNEL_MS <ms>" to stderr as a stable,
        machine-parseable token (host-side timing only, does not affect the image). */
     cudaEvent_t nb_kern_start, nb_kern_stop;
     CUDA_CHECK_RETURN(cudaEventCreate(&nb_kern_start));
     CUDA_CHECK_RETURN(cudaEventCreate(&nb_kern_stop));
-    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_start));
+    CUDA_CHECK_RETURN(cudaDeviceSynchronize());   /* MANDATORY: drain all H2D copies + the counter memset */
+    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_start, kernelStream));
 
-    nanoBraggSpotsCUDAKernel<<<numBlocks, threadsPerBlock>>>(cu_detector, cu_beam, cu_goniometer, cu_sample, cu_crystal, cu_constants, cu_beam_sources, cu_Fhkl,
-            cu_phi_mos_a, cu_phi_mos_b, cu_phi_mos_c, cu_maskimage, cu_floatimage /*out*/, cu_omega_reduction/*out*/, cu_max_I_x_reduction/*out*/, cu_max_I_y_reduction /*out*/, cu_rangemap /*out*/);
+    nanoBraggSpotsCUDAKernel<<<numBlocks, threadsPerBlock, 0, kernelStream>>>(cu_detector, cu_beam, cu_goniometer, cu_sample, cu_crystal, cu_constants, cu_beam_sources, cu_Fhkl,
+            cu_phi_mos_a, cu_phi_mos_b, cu_phi_mos_c, cu_maskimage, cu_floatimage /*out*/, cu_omega_reduction/*out*/, cu_max_I_x_reduction/*out*/, cu_max_I_y_reduction /*out*/, cu_rangemap /*out*/, cu_progress, d_progress, progress_meter);
 
-    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_stop));
+    CUDA_CHECK_RETURN(cudaEventRecord(nb_kern_stop, kernelStream));
     CUDA_CHECK_RETURN(cudaPeekAtLastError());
-    CUDA_CHECK_RETURN(cudaEventSynchronize(nb_kern_stop));
+
+    if (!progress_meter) {
+        /* -noprogress: baseline path -- the kernel issued no atomics/stores; just join, no prints
+           (no 0%, no 1-99%, no 100%). */
+        CUDA_CHECK_RETURN(cudaStreamSynchronize(kernelStream));
+    } else {
+        /* Parent-owned bookend: print 0% once, right before entering the poll loop. */
+        printf("%lu%% done\n", 0UL);
+        fflush(stdout);
+
+        unsigned int  running_max = 0;   /* host-side monotone max over torn/laggy mapped reads */
+        unsigned long last_pct    = 0;   /* highest integer percent already printed */
+        /* cudaStreamQuery is used RAW here -- NEVER wrapped in CUDA_CHECK_RETURN, which would exit(1)
+           on the normal, expected cudaErrorNotReady. It is NON-BLOCKING and touches no copy queue. */
+        while (cudaStreamQuery(kernelStream) == cudaErrorNotReady) {
+            /* ZERO-COPY read of the host-mapped scalar through its HOST pointer -- the kernel's
+               __threadfence_system() store is directly visible. HARD RULE: no cudaMemcpy /
+               cudaMemcpyAsync / cudaStreamSynchronize in this loop. On WSL2 there is no copy/execute
+               overlap, so any blocking copy/sync here re-serializes the whole loop behind the kernel
+               and the meter degrades to one poll at the end. */
+            unsigned int v = *(volatile unsigned int *)h_progress;
+            if (v > running_max) running_max = v;
+            unsigned long pct = (total_pixels > 0)                  /* guard total_pixels == 0 */
+                    ? (unsigned long)running_max * 100UL / (unsigned long)total_pixels
+                    : 0UL;
+            if (pct > 99UL) pct = 99UL;         /* the loop owns only 1-99%; 0% and 100% are the parent's */
+            /* CPU-reference cadence (nanoBraggCPU meter): emit every crossed print-worthy percent,
+               not just the newest, so a poll that jumps several percent stays faithful. Print-worthy
+               = a multiple of 5, or inside the first 10% (p < 10) or last 10% (p > 90): 1% steps at
+               the ends, 5% steps through the middle -> 0,1..9,10,15..90,91..99,100. */
+            for (unsigned long p = last_pct + 1UL; p <= pct; ++p) {
+                if (p % 5UL == 0UL || p < 10UL || p > 90UL) {
+                    printf("%lu%% done\n", p);
+                    fflush(stdout);                     /* stream live even when stdout is a pipe */
+                }
+            }
+            last_pct = pct;
+            usleep(50000);   /* ~50 ms cadence */
+        }
+        CUDA_CHECK_RETURN(cudaStreamSynchronize(kernelStream));   /* final join before any result output */
+        printf("%lu%% done\n", 100UL);                            /* parent-owned bookend: meter ends at 100% */
+        fflush(stdout);   /* emitted immediately after the join, before KERNEL_MS and all other output */
+    }
+
     {
         float nb_kernel_ms = 0.0f;
         CUDA_CHECK_RETURN(cudaEventElapsedTime(&nb_kernel_ms, nb_kern_start, nb_kern_stop));
         fprintf(stderr, "KERNEL_MS %f\n", nb_kernel_ms);
     }
+
     CUDA_CHECK_RETURN(cudaEventDestroy(nb_kern_start));
     CUDA_CHECK_RETURN(cudaEventDestroy(nb_kern_stop));
-    CUDA_CHECK_RETURN(cudaDeviceSynchronize());
 
     CUDA_CHECK_RETURN(cudaMemcpy(floatimage, cu_floatimage, sizeof(*cu_floatimage) * total_pixels, cudaMemcpyDeviceToHost));
     CUDA_CHECK_RETURN(cudaMemcpy(omega_reduction, cu_omega_reduction, sizeof(*cu_omega_reduction) * total_pixels, cudaMemcpyDeviceToHost));
@@ -671,6 +735,9 @@ extern "C" void nanoBraggSpotsCUDA(int spixels, int fpixels, int roi_xmin, int r
     CUDA_CHECK_RETURN(cudaFree(cu_max_I_y_reduction));
     CUDA_CHECK_RETURN(cudaFree(cu_maskimage));
     CUDA_CHECK_RETURN(cudaFree(cu_rangemap));
+    CUDA_CHECK_RETURN(cudaFree(cu_progress));           /* device-global counter */
+    CUDA_CHECK_RETURN(cudaFreeHost(h_progress));        /* host-mapped pinned scalar (NOT cudaFree) */
+    CUDA_CHECK_RETURN(cudaStreamDestroy(kernelStream));
 
     *max_I = 0;
     *max_I_x = 0;
@@ -716,7 +783,8 @@ static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restric
         const crystalParams * crystal, const constParams * __restrict__ constants, const beamSource * __restrict__ beam_sources, const float * __restrict__ Fhkl,
         const Real * __restrict__ phi_mos_a, const Real * __restrict__ phi_mos_b, const Real * __restrict__ phi_mos_c, const int unsigned short * __restrict__ maskimage, float * floatimage /*out*/,
         float * omega_reduction/*out*/, float * max_I_x_reduction/*out*/,
-        float * max_I_y_reduction /*out*/, bool * rangemap) {
+        float * max_I_y_reduction /*out*/, bool * rangemap, unsigned int * progress,
+        unsigned int * progress_pub, int progress_meter) {
 
     __shared__ float s_Na, s_Nb, s_Nc;
 
@@ -739,6 +807,21 @@ static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restric
     const float I_bg = water_bg(sample->water_F, constants->r_e_sqr, beam->fluence, constants->r_e_sqr_fluence, sample->water_size, constants->Avogadro, sample->water_MW);
 
     for (long pixIdx = (blockDim.y * blockIdx.y + threadIdx.y) * fstride + blockDim.x * blockIdx.x + threadIdx.x; pixIdx < total_pixels; pixIdx += stride) {
+        /* progress: threadIdx.x == 0 of each row adds this wave's assigned pixels to the device-global
+           fine counter (before the ROI skip, so it counts assigned pixels), then PUBLISHES the running
+           total to the host-mapped scalar so the host can read it copy-free. __threadfence_system()
+           pushes the mapped store out to host visibility; a plain store + this fence is sufficient
+           (atomicAdd_system not required). progress_meter is warp-uniform (a scalar kernel arg), so
+           with -noprogress neither the atomic nor the publish is issued -- the path is bit-for-bit
+           baseline. The count stays correct for any block shape: the blockDim.y threads with
+           threadIdx.x == 0 each add blockDim.x, summing to the block's per-wave pixel count. The
+           atomicAdd and the mapped store + fence both run every wave so the published counter stays
+           exact and current. */
+        if (progress_meter && threadIdx.x == 0) {
+            unsigned int published = atomicAdd(progress, blockDim.x) + blockDim.x;
+            *(volatile unsigned int *)progress_pub = published;
+            __threadfence_system();
+        }
         const short fpixel = pixIdx % detector->fpixels;
         const short spixel = pixIdx / detector->fpixels;
 
