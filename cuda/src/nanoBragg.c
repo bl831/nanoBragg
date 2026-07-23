@@ -2528,14 +2528,14 @@ int main(int argc, char** argv)
 		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
 		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,
 		interpolate, Fhkl, h_min, h_max, h_range, k_min, k_max, k_range, l_min, l_max, l_range, hkls, nopolar, polar_vector, polarization, fudge, maskimage,
-		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/);
+		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/, progress_meter);
 	else
 	nanoBraggSpotsCUDA_single(spixels, fpixels, roi_xmin, roi_xmax, roi_ymin, roi_ymax, oversample, point_pixel, pixel_size, subpixel_size, steps, detector_thickstep,
 		detector_thicksteps, detector_thick, detector_mu, sdet_vector, fdet_vector, odet_vector, pix0_vector, curved_detector, distance, close_distance, beam_vector,
 		Xbeam, Ybeam, dmin, phi0, phistep, phisteps, spindle_vector, sources, source_X, source_Y, source_Z, source_I, source_lambda, a0, b0, c0, xtal_shape,
 		mosaic_spread, mosaic_domains, mosaic_umats, Na, Nb, Nc, V_cell, water_size, water_F, water_MW, r_e_sqr, fluence, Avogadro, integral_form, default_F,
 		interpolate, Fhkl, h_min, h_max, h_range, k_min, k_max, k_range, l_min, l_max, l_range, hkls, nopolar, polar_vector, polarization, fudge, maskimage,
-		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/);
+		floatimage /*out*/, &omega_sum/*out*/, &sumn /*out*/, &sum /*out*/, &sumsqr /*out*/, &max_I/*out*/, &max_I_x/*out*/, &max_I_y /*out*/, progress_meter);
 
     printf("\n");
 
