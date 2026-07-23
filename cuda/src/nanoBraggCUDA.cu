@@ -157,14 +157,14 @@ struct crystalParams {
     float default_F;
     float dmin;
     shapetype xtal_shape;
-    short mosaic_domains;
+    int mosaic_domains;
     structureFactorParams fhklParams;
 };
 
 struct goniometerParams {
     float phi0;
     float phistep;
-    short phisteps;
+    int phisteps;
     float spindle_vector[VECTOR_SIZE];
 };
 
@@ -985,10 +985,10 @@ static __global__ void nanoBraggSpotsCUDAKernel(const detectorParams * __restric
                         }
 
                         /* sweep over phi angles */
-                        for (short phi_tic = 0; phi_tic < goniometer->phisteps; ++phi_tic) {
+                        for (int phi_tic = 0; phi_tic < goniometer->phisteps; ++phi_tic) {
 
                             /* enumerate mosaic domains */
-                            for (short mos_tic = 0; mos_tic < crystal->mosaic_domains; ++mos_tic) {
+                            for (int mos_tic = 0; mos_tic < crystal->mosaic_domains; ++mos_tic) {
 
                                 /* Outputs of the lattice-shape block below, all single precision:
                                    the Miller indices h,k,l (the round crystal shapes need their
