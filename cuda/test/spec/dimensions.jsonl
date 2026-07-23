@@ -22,7 +22,7 @@
 {"dim":"twotheta","class":"detector","kind":"scalar","flag":"-twotheta","baseline":0,"values":[0,20,45]}
 {"dim":"water","class":"background","kind":"scalar","flag":"-water","baseline":0,"values":[0,1,10]}
 {"dim":"shape","class":"crystal","kind":"enum","baseline":"square","values":[{"val":"square","args":["-square_xtal"]},{"val":"round","args":["-round_xtal"]}]}
-{"dim":"convention","class":"detector","kind":"enum","baseline":"mosflm","values":[{"val":"mosflm","args":["-mosflm"]},{"val":"xds","args":["-xds"]},{"val":"adxv","args":["-adxv"]}]}
+{"dim":"convention","class":"detector","kind":"enum","baseline":"mosflm","values":[{"val":"mosflm","args":["-mosflm"]},{"val":"xds","args":["-xds"]},{"val":"adxv","args":["-adxv"]},{"val":"denzo","args":["-denzo"]},{"val":"dials","args":["-dials"]}]}
 {"dim":"pivot","class":"detector","kind":"enum","baseline":"beam","values":[{"val":"beam","args":["-pivot","beam"]},{"val":"sample","args":["-pivot","sample"]}]}
 {"dim":"point_pixel","class":"detector","kind":"enum","baseline":"off","values":[{"val":"off","args":[]},{"val":"on","args":["-point_pixel"]}]}
 {"dim":"curved_det","class":"detector","kind":"enum","baseline":"off","values":[{"val":"off","args":[]},{"val":"on","args":["-curved_det"]}]}

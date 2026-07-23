@@ -60,6 +60,8 @@ cov_water_10	PASS	0.9999993	0.999864
 cov_shape_round	PASS	0.9999998	0.999266
 cov_convention_xds	PASS	0.9999999	0.999810
 cov_convention_adxv	PASS	0.9999999	0.999810
+cov_convention_denzo	PASS	0.9999998	0.999843
+cov_convention_dials	PASS	0.9999999	0.999810
 cov_pivot_sample	PASS	0.9999993	0.999853
 cov_point_pixel_on	PASS	0.9999993	0.999865
 cov_curved_det_on	PASS	0.9999993	1.000139
@@ -73,3 +75,10 @@ flat_control	FAIL	0.9825354	1.153570
 curved_stress	FAIL	0.9748349	0.959820
 cancellation	FAIL	0.9994239	0.993171
 extreme_geom	PASS	1.0000000	1.000051
+thick_main	PASS	0.9999996	0.999423
+feat_energy	PASS	1.0000000	0.999949
+feat_roi	PASS	0.9999989	0.999778
+feat_nonsquare	PASS	0.9999993	0.999853
+feat_xds_orgxy	PASS	0.9999996	0.999808
+feat_xyclose	PASS	0.9999993	0.999853
+feat_closedist	PASS	0.9999993	0.999853

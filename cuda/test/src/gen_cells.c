@@ -806,6 +806,7 @@ int main(int argc, char **argv) {
     else if (strcmp(suite, "coverage") == 0) count = build_coverage(&S, out);
     else if (strcmp(suite, "guards") == 0)   count = build_scenarios(&S, out, "guards");
     else if (strcmp(suite, "perf") == 0)     count = build_scenarios(&S, out, "perf");
+    else if (strcmp(suite, "pairwise") == 0) count = build_scenarios(&S, out, "pairwise");
     else { fprintf(stderr, "gen_cells: unknown suite '%s'\n", suite); if (outpath) fclose(out); return 2; }
 
     if (outpath) fclose(out);

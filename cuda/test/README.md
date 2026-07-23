@@ -47,9 +47,18 @@ to different suites.
 - `grid320` — Cartesian cross of crystal × crystal_size × grid320 × orientation
   (4×4×5×4 = 320). Reproduces the canonical parity grid cell-for-cell.
 - `coverage` — main-effects: a baseline cell, then one cell per (dimension, value)
-  that differs from that dimension's baseline (only that dimension changed).
+  that differs from that dimension's baseline (only that dimension changed), plus
+  hand-authored feature/interaction scenarios (detector thickness, `-energy`,
+  `-roi`, non-square detector, alternate beam centers, custom basis, powder, the
+  curved-detector and cancellation stress cells).
 - `guards` — hand-authored cells the GPU kernel must REFUSE (see "Reject gate" below).
 - `perf` — hand-authored cells tagged for timing (see "Perf suite" below).
+- `pairwise` — a 12-run Plackett-Burman covering array (strength-2, every pair of
+  factor levels co-occurs) over 8 risky axes: curved_det × N × lambda × pixel ×
+  oversample × detector-thickness × misset × dispersion.
+
+Untested axes needing external data files (documented gaps, not yet cells):
+`-mask` (an SMV mask image) and `-sourcefile` (a source-list file).
 
 ## Running
 
@@ -88,8 +97,11 @@ code: `9` → `REJECT` (expected), `0` → `FAIL` (silent no-op regression: it
 produced an image it should have refused), anything else → `BLOCKED`. `REJECT` is
 its own tally bucket (not folded into `BLOCKED`) and participates in golden
 comparison exactly like `PASS`/`FAIL` (a golden `REJECT` vs an actual `FAIL` or
-`BLOCKED` is a flip). The `guards` suite currently has one cell:
-`guard_interpolate` (explicit `-interpolate` must be GPU-rejected).
+`BLOCKED` is a flip). The `guards` suite has eight cells, one per GPU-unsupported
+option that must be refused: `guard_interpolate` (explicit `-interpolate`),
+`guard_gauss` (`-gauss_xtal`), `guard_tophat` (`-binary_spots`), `guard_fudge`
+(`-fudge` ≠ 1), `guard_stol` / `guard_4stol` / `guard_Q` (amorphous-background
+tables), and `guard_osthick0` (explicit `-oversample_thick 0`).
 
 ## Perf suite (min-of-5, warn-not-fail)
 
