@@ -179,6 +179,11 @@ __device__ static float *cross_product(const float * x, const float * y, float *
 __device__ __inline__ float norm3d_fma_rn(float v1, float v2, float v3);
 /* rotate a 3-vector about a unit vector axis */
 __device__ static float *rotate_axis(const float * __restrict__ v, float *newv, const float * __restrict__ axis, const float phi);
+/* compensated-pair rotate: the angle is carried as a (hi, lo) pair and its sin/cos are
+   rebuilt in df arithmetic (see df_sincos), keeping both above single precision */
+__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float2 phi);
+/* sin and cos of a compensated-pair angle, returned as compensated pairs, float-only */
+__device__ __inline__ static void df_sincos(float2 phi, float2 * sinphi, float2 * cosphi);
 __device__ __inline__ static long flatten3dindex(short x, short y, short z, short x_range, short y_range, short z_range);
 __device__ __inline__ float quickFcell_ldg(short hkls, short h0, short h_max, short h_min, short k0, short k_max, short k_min, short l0, short l_max,
         short l_min, short h_range,
@@ -1413,17 +1418,58 @@ __device__ __inline__ static float parallax(const float2 * __restrict__ odet, co
     return real_to_float(__ldg(&odet[1])) * diffracted_f[1] + real_to_float(__ldg(&odet[2])) * diffracted_f[2] + real_to_float(__ldg(&odet[3])) * diffracted_f[3];
 }
 
+/* sin and cos of a compensated-pair angle, returned as compensated pairs, computed with
+   float-only arithmetic. The hardware sinf/cosf carry ~1 ulp of rounding error; that error,
+   though tiny, shifts a sharp interference fringe enough to redistribute a fraction of a
+   percent of the total flux on a curved detector at fine reciprocal-space sampling. Rebuilding
+   the trig in df arithmetic keeps the low word the hardware call would discard.
+
+   Cody-Waite range reduction folds phi into [-pi/4, pi/4] by subtracting k*(pi/2) with pi/2
+   held as a (hi, lo) pair, then Horner polynomials evaluated entirely in df pick up sin/cos of
+   the reduced angle; the quadrant k selects and signs the two results. Coefficients are the
+   Taylor terms carried as pairs so their low words survive too; four terms beyond the constant
+   drive the polynomial truncation error below the ~1 ulp the hardware call loses. */
+__device__ __inline__ static void df_sincos(float2 phi, float2 * sinphi, float2 * cosphi) {
+    const float2 PIO2 = make_float2(1.570796371e+00f, -4.371138829e-08f);
+    const float  TWO_OVER_PI = 6.366197467e-01f;
+    /* reduce phi to r in [-pi/4, pi/4]; k tracks the quadrant */
+    const float kf = rintf(phi.x * TWO_OVER_PI);
+    const float2 r = df_sub(phi, df_mul_f(PIO2, kf));
+    const float2 r2 = df_mul(r, r);
+    /* sin(r) = r * (1 + r2*(c1 + r2*(c2 + r2*(c3 + r2*c4)))) */
+    float2 s = make_float2(2.755731884e-06f, 3.793571224e-14f);
+    s = df_add(df_mul(s, r2), make_float2(-1.984127011e-04f, 2.725596875e-12f));
+    s = df_add(df_mul(s, r2), make_float2( 8.333333768e-03f, -4.346172033e-10f));
+    s = df_add(df_mul(s, r2), make_float2(-1.666666716e-01f,  4.967053879e-09f));
+    s = df_add_f(df_mul(s, r2), 1.0f);
+    const float2 sin_r = df_mul(r, s);
+    /* cos(r) = 1 + r2*(d1 + r2*(d2 + r2*(d3 + r2*d4))) */
+    float2 c = make_float2(2.480158764e-05f, -3.406996094e-13f);
+    c = df_add(df_mul(c, r2), make_float2(-1.388888923e-03f,  3.363109444e-11f));
+    c = df_add(df_mul(c, r2), make_float2( 4.166666791e-02f, -1.241763470e-09f));
+    c = df_add(df_mul(c, r2), make_float2(-5.000000000e-01f,  0.000000000e+00f));
+    const float2 cos_r = df_add_f(df_mul(c, r2), 1.0f);
+    /* quadrant fold: q = k mod 4 in {0,1,2,3} */
+    const int q = ((int) kf) & 3;
+    const float2 neg_sin = make_float2(-sin_r.x, -sin_r.y);
+    const float2 neg_cos = make_float2(-cos_r.x, -cos_r.y);
+    if (q == 0)      { *sinphi = sin_r;   *cosphi = cos_r; }
+    else if (q == 1) { *sinphi = cos_r;   *cosphi = neg_sin; }
+    else if (q == 2) { *sinphi = neg_sin; *cosphi = neg_cos; }
+    else             { *sinphi = neg_cos; *cosphi = sin_r; }
+}
+
 /* compensated-pair form of the axis rotation: rotate the (hi, lo) vector v about the
-   (hi, lo) unit axis by angle phi, writing the (hi, lo) result into newv. The trig
-   constants sin(phi)/cos(phi) are single-precision scalars (one sin and one cos, as in
-   the float rotate_axis); every vector product and sum is carried as a compensated pair
-   so the rotated position keeps its low word instead of collapsing to float. Mirrors the
-   float rotate_axis term for term:
+   (hi, lo) unit axis by the (hi, lo) angle phi, writing the (hi, lo) result into newv.
+   sin(phi)/cos(phi) are rebuilt as compensated pairs by df_sincos, so the rotation angle
+   stays above single precision through the trig term as well as the vector algebra; every
+   vector product and sum is carried as a compensated pair so the rotated position keeps its
+   low word instead of collapsing to float. Mirrors the float rotate_axis term for term:
        newv = v*cos + (axis x v)*sin + axis*(axis . v)*(1 - cos)
    4-element convention, element 0 (magnitude) left untouched. */
-__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float phi) {
-    const float sinphi = sin(phi);
-    const float cosphi = cos(phi);
+__device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, float2 * newv, const float2 * __restrict__ axis, const float2 phi) {
+    float2 sinphi, cosphi;
+    df_sincos(phi, &sinphi, &cosphi);
     const float2 a1 = axis[1];
     const float2 a2 = axis[2];
     const float2 a3 = axis[3];
@@ -1431,24 +1477,28 @@ __device__ __inline__ static void rotate_axis(const float2 * __restrict__ v, flo
     const float2 v2 = v[2];
     const float2 v3 = v[3];
     float2 dot = df_add(df_add(df_mul(a1, v1), df_mul(a2, v2)), df_mul(a3, v3));
-    dot = df_mul_f(dot, 1.0f - cosphi);
+    dot = df_mul(dot, df_sub(make_float2(1.0f, 0.0f), cosphi));
 
-    newv[1] = df_add(df_add(df_mul(a1, dot), df_mul_f(v1, cosphi)),
-                     df_mul_f(df_sub(df_mul(a2, v3), df_mul(a3, v2)), sinphi));
-    newv[2] = df_add(df_add(df_mul(a2, dot), df_mul_f(v2, cosphi)),
-                     df_mul_f(df_sub(df_mul(a3, v1), df_mul(a1, v3)), sinphi));
-    newv[3] = df_add(df_add(df_mul(a3, dot), df_mul_f(v3, cosphi)),
-                     df_mul_f(df_sub(df_mul(a1, v2), df_mul(a2, v1)), sinphi));
+    newv[1] = df_add(df_add(df_mul(a1, dot), df_mul(v1, cosphi)),
+                     df_mul(df_sub(df_mul(a2, v3), df_mul(a3, v2)), sinphi));
+    newv[2] = df_add(df_add(df_mul(a2, dot), df_mul(v2, cosphi)),
+                     df_mul(df_sub(df_mul(a3, v1), df_mul(a1, v3)), sinphi));
+    newv[3] = df_add(df_add(df_mul(a3, dot), df_mul(v3, cosphi)),
+                     df_mul(df_sub(df_mul(a1, v2), df_mul(a2, v1)), sinphi));
 }
 
 /* curved-detector pixel rotation: construct a detector pixel that is always "distance"
    from the sample by rotating pixel_pos about sdet_vector then fdet_vector. The float
    form is the base kernel's exact rotation, operating directly on pixel_pos. The df64
-   form carries the rotation in the compensated pair representation: the rotation angles
-   are the same single-precision pixel_pos[2]/distance and pixel_pos[3]/distance the float
-   form uses (and the sin/cos are single-precision scalars inside rotate_axis), but the
-   vector being rotated and the sdet/fdet basis stay (hi, lo) pairs, so the rotated pixel
-   position keeps its low word rather than collapsing to float across the rotation. */
+   form carries the rotation angle AND its sin/cos above single precision: the angle is
+   pixel_pos[k]/distance formed as a compensated pair, and rotate_axis rebuilds sin/cos in df
+   (via df_sincos) so neither the angle's low bits nor the trig rounding collapse to float. At
+   short wavelength and large crystals the reciprocal-space sampling is so fine that a
+   single-precision angle and single-precision sin/cos shift the rotated pixel a fraction of a
+   lattice fringe, redistributing a fraction of a percent of the total flux versus the double
+   CPU reference; carrying both in df closes that gap with float-only arithmetic. The
+   distance*beam vector rotated below keeps single precision -- its storage precision was
+   measured not to affect the result. */
 __device__ __inline__ static void curved_position(const float * sdet_vector, const float * fdet_vector, float distance,
         const float * dbvector, float * pixel_pos) {
     float newvector[4];
@@ -1457,10 +1507,11 @@ __device__ __inline__ static void curved_position(const float * sdet_vector, con
 }
 __device__ __inline__ static void curved_position(const float2 * sdet_vector, const float2 * fdet_vector, float distance,
         const float * dbvector, float2 * pixel_pos) {
-    /* rotation angles from the high word of the compensated pixel position, matching the
-       float form's pixel_pos[2]/distance and pixel_pos[3]/distance exactly. */
-    const float phi_s = real_to_float(pixel_pos[2]) / distance;
-    const float phi_f = real_to_float(pixel_pos[3]) / distance;
+    /* rotation angles = pixel offset / distance, formed as compensated pairs so their low
+       words survive; distance is exact as a float, so a df divide by (distance, 0) suffices. */
+    const float2 dist_pair = make_float2(distance, 0.0f);
+    const float2 phi_s = df_div(pixel_pos[2], dist_pair);
+    const float2 phi_f = df_div(pixel_pos[3], dist_pair);
     /* dbvector is the single-precision sample->distance * beam_vector input; widen it to
        compensated pairs so the whole rotation runs in the pair representation. sdet_vector
        and fdet_vector are already Real (float2) here, so they enter the rotation as pairs
